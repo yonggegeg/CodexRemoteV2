@@ -71,6 +71,7 @@ struct ThreadsView: View {
         ("codex", "收到。这个 v2 界面会做成类似桌面版，支持上下文同步、图片发送和窗口截图。", false),
         ("codex", "打开窗口 Tab 可以选择两个电脑窗口，双指放大后再把截图发给 Codex。", true)
     ]
+    private let latestMessageAnchor = "latest-message-anchor"
 
     var body: some View {
         NavigationStack {
@@ -79,19 +80,6 @@ struct ThreadsView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
                             HeaderCard()
-                            workspaceHeader
-                            if client.threadItems.isEmpty {
-                                ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
-                                    ChatMessageCard(role: message.0, text: message.1, compact: message.2)
-                                        .id(index)
-                                }
-                            } else {
-                                ForEach(client.threadItems) { item in
-                                    ChatMessageCard(role: item.isUser ? "user" : "codex", text: item.text, compact: item.type != nil)
-                                        .id(item.id)
-                                }
-                            }
-
                             if !client.threads.isEmpty {
                                 VStack(alignment: .leading, spacing: 10) {
                                     Text("电脑 Codex 任务")
@@ -108,6 +96,21 @@ struct ThreadsView: View {
                                 .padding(14)
                                 .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                             }
+                            workspaceHeader
+                            if client.threadItems.isEmpty {
+                                ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
+                                    ChatMessageCard(role: message.0, text: message.1, compact: message.2)
+                                        .id(index)
+                                }
+                            } else {
+                                ForEach(client.threadItems) { item in
+                                    ChatMessageCard(role: item.isUser ? "user" : "codex", text: item.text, compact: item.type != nil)
+                                        .id(item.id)
+                                }
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id(latestMessageAnchor)
                             if let sendStatus = client.lastSendStatus {
                                 Label(sendStatus, systemImage: "paperplane.circle.fill")
                                     .font(.footnote)
@@ -126,6 +129,10 @@ struct ThreadsView: View {
                     .background(Color(.systemGroupedBackground))
                     .scrollDismissesKeyboard(.interactively)
                     .onTapGesture { hideKeyboard() }
+                    .onAppear { scrollToLatest(proxy, animated: false) }
+                    .onChange(of: client.threadItems.count) { _ in scrollToLatest(proxy) }
+                    .onChange(of: client.threadItems.last?.id) { _ in scrollToLatest(proxy) }
+                    .onChange(of: client.selectedThreadId) { _ in scrollToLatest(proxy, delay: 0.35) }
                 }
                 DesktopComposer(
                     text: $inputText,
@@ -190,6 +197,18 @@ struct ThreadsView: View {
                 await client.sendGuideMessage(outgoing, settings: settings)
             } else {
                 await client.sendGuideMessage(outgoing, settings: settings)
+            }
+        }
+    }
+
+    private func scrollToLatest(_ proxy: ScrollViewProxy, animated: Bool = true, delay: Double = 0.12) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            if animated {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo(latestMessageAnchor, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(latestMessageAnchor, anchor: .bottom)
             }
         }
     }
