@@ -89,6 +89,8 @@ struct ThreadsView: View {
     @State private var permissionMode: String = "full"
     @State private var showActionDrawer: Bool = false
     @State private var showTaskSwitcher: Bool = false
+    @State private var followLatest: Bool = true
+    @State private var hasNewMessages: Bool = false
 
     private let sampleMessages: [(String, String, Bool)] = [
         ("user", "我需要手机 App 能同步电脑 Codex 当前对话，并且可以随时发送引导消息纠正操作。", false),
@@ -101,6 +103,7 @@ struct ThreadsView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 ScrollViewReader { proxy in
+                    ZStack(alignment: .bottom) {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
                             HeaderCard()
@@ -134,15 +137,41 @@ struct ThreadsView: View {
                         }
                         .padding(16)
                     }
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 8)
+                            .onChanged { value in
+                                if value.translation.height > 6 {
+                                    followLatest = false
+                                }
+                            }
+                    )
+                    if hasNewMessages && !followLatest {
+                        Button {
+                            followLatest = true
+                            hasNewMessages = false
+                            scrollToLatest(proxy, delay: 0)
+                        } label: {
+                            Label("跳到最新", systemImage: "arrow.down.circle.fill")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.ultraThinMaterial, in: Capsule())
+                        }
+                        .padding(.bottom, 10)
+                    }
+                    }
                     .background(Color(.systemGroupedBackground))
                     .scrollDismissesKeyboard(.interactively)
                     .onTapGesture { hideKeyboard() }
                     .onAppear { scrollToLatest(proxy, animated: false) }
-                    .onChange(of: client.threadItems.count) { _ in scrollToLatest(proxy, delay: 0.05) }
-                    .onChange(of: client.threadItems.last?.id) { _ in scrollToLatest(proxy, delay: 0.05) }
-                    .onChange(of: client.threadItems.last?.text) { _ in scrollToLatest(proxy, delay: 0.05) }
-                    .onReceive(client.$threadItems) { _ in scrollToLatest(proxy, delay: 0.05) }
-                    .onChange(of: client.selectedThreadId) { _ in scrollToLatest(proxy, delay: 0.35) }
+                    .onChange(of: client.threadItems.count) { _ in handleNewContent(proxy) }
+                    .onChange(of: client.threadItems.last?.id) { _ in handleNewContent(proxy) }
+                    .onChange(of: client.threadItems.last?.text) { _ in handleNewContent(proxy) }
+                    .onChange(of: client.selectedThreadId) { _ in
+                        followLatest = true
+                        hasNewMessages = false
+                        scrollToLatest(proxy, delay: 0.35)
+                    }
                 }
                 DesktopComposer(
                     text: $inputText,
@@ -222,6 +251,7 @@ struct ThreadsView: View {
         let outgoing = text
         inputText = ""
         hideKeyboard()
+        followLatest = true
         Task {
             if guideMode {
                 await client.sendGuideMessage(outgoing, settings: settings)
@@ -240,6 +270,15 @@ struct ThreadsView: View {
             } else {
                 proxy.scrollTo(latestMessageAnchor, anchor: .bottom)
             }
+        }
+    }
+
+    private func handleNewContent(_ proxy: ScrollViewProxy) {
+        if followLatest {
+            hasNewMessages = false
+            scrollToLatest(proxy, delay: 0.05)
+        } else {
+            hasNewMessages = true
         }
     }
 }
@@ -357,9 +396,7 @@ struct ChatMessageCard: View {
                         .background(Color(.tertiarySystemFill), in: Capsule())
                 }
             }
-            Text(text)
-                .font(.subheadline)
-                .textSelection(.enabled)
+            RichMessageText(text: text)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -396,9 +433,7 @@ struct ThreadItemCard: View {
                     }
                 }
                 if !item.text.isEmpty {
-                    Text(item.text)
-                        .font(.subheadline)
-                        .textSelection(.enabled)
+                    RichMessageText(text: item.text)
                 }
                 ImageStrip(images: item.images ?? [])
             }
@@ -415,6 +450,115 @@ struct ThreadItemCard: View {
         case "agentmessage": return "回复"
         default: return type
         }
+    }
+}
+
+struct RichMessageText: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .text(let value):
+                    markdownText(value)
+                case .code(let language, let code):
+                    CodeBlockView(language: language, code: code)
+                }
+            }
+        }
+    }
+
+    private var blocks: [RichBlock] {
+        parseRichBlocks(text)
+    }
+
+    @ViewBuilder
+    private func markdownText(_ value: String) -> some View {
+        let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleaned.isEmpty {
+            if let attributed = try? AttributedString(markdown: cleaned, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+                Text(attributed)
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            } else {
+                Text(cleaned)
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+enum RichBlock {
+    case text(String)
+    case code(language: String, code: String)
+}
+
+private func parseRichBlocks(_ text: String) -> [RichBlock] {
+    let lines = text.components(separatedBy: .newlines)
+    var result: [RichBlock] = []
+    var normal: [String] = []
+    var code: [String] = []
+    var inCode = false
+    var language = "text"
+
+    func flushNormal() {
+        let value = normal.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.isEmpty { result.append(.text(value)) }
+        normal.removeAll()
+    }
+
+    func flushCode() {
+        let value = code.joined(separator: "\n").trimmingCharacters(in: .newlines)
+        result.append(.code(language: language.isEmpty ? "text" : language, code: value))
+        code.removeAll()
+        language = "text"
+    }
+
+    for line in lines {
+        if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+            if inCode {
+                flushCode()
+                inCode = false
+            } else {
+                flushNormal()
+                inCode = true
+                language = String(line.trimmingCharacters(in: .whitespaces).dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        } else if inCode {
+            code.append(line)
+        } else {
+            normal.append(line)
+        }
+    }
+    if inCode { flushCode() }
+    flushNormal()
+    return result
+}
+
+struct CodeBlockView: View {
+    let language: String
+    let code: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(language.isEmpty ? "text" : language)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Image(systemName: "doc.on.doc")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(code)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
