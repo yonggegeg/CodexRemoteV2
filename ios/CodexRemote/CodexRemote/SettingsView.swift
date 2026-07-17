@@ -9,7 +9,7 @@ struct SettingsView: View {
             Form {
                 Section(
                     header: Text("连接"),
-                    footer: Text("v2 默认端口建议使用 8081，例如 http://115.159.221.170:8081。")
+                    footer: Text("v2 当前使用公网端口 8080，例如 http://115.159.221.170:8080。")
                 ) {
                     TextField("服务器地址", text: $settings.serverURL)
                         .textInputAutocapitalization(.never)

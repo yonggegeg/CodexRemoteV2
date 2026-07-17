@@ -105,7 +105,7 @@ class CodexAppServer {
     if (this.initialized) return;
     await this.request('initialize', {
       clientInfo: { name: 'codex-remote-windows-agent-v2', version: '0.3.0' },
-      capabilities: {}
+      capabilities: { experimentalApi: true }
     }, 30000);
     this.initialized = true;
   }
@@ -129,12 +129,24 @@ class CodexAppServer {
 
   async listThreadItems(threadId, limit = 80) {
     await this.initialize();
-    const result = await this.request('thread/items/list', {
-      threadId,
-      limit,
-      sortDirection: 'asc'
-    });
-    return result.data || [];
+    try {
+      const result = await this.request('thread/items/list', {
+        threadId,
+        limit,
+        sortDirection: 'asc'
+      });
+      return result.data || [];
+    } catch (err) {
+      const result = await this.request('thread/read', { threadId, includeTurns: true });
+      const turns = result.thread?.turns || [];
+      const items = [];
+      for (const turn of turns) {
+        for (const item of turn.items || []) {
+          items.push({ ...item, turnId: turn.id });
+        }
+      }
+      return items.slice(-limit);
+    }
   }
 
   simplifyThreadItems(items) {
@@ -150,6 +162,7 @@ class CodexAppServer {
           return c.text || c.content || c.summary || '';
         }).filter(Boolean).join('\n');
       }
+      if (!text && Array.isArray(raw.summary)) text = raw.summary.join('\n');
       if (!text && raw.name) text = raw.name;
       if (!text) {
         try { text = JSON.stringify(raw).slice(0, 1200); } catch { text = ''; }

@@ -44,15 +44,15 @@ function Get-WindowsList {
     $w = $rect.Right - $rect.Left
     $h = $rect.Bottom - $rect.Top
     if ($w -lt 80 -or $h -lt 60) { return $true }
-    $pid = 0
-    [void][WinApi]::GetWindowThreadProcessId($hWnd, [ref]$pid)
+    [uint32]$processId = 0
+    [void][WinApi]::GetWindowThreadProcessId($hWnd, [ref]$processId)
     $process = ""
-    try { $process = (Get-Process -Id $pid -ErrorAction Stop).ProcessName } catch {}
+    try { $process = (Get-Process -Id ([int]$processId) -ErrorAction Stop).ProcessName } catch {}
     $items.Add([pscustomobject]@{
       hwnd = $hWnd.ToInt64().ToString()
       title = $title
       process = $process
-      pid = $pid
+      pid = [int]$processId
       x = $rect.Left
       y = $rect.Top
       width = $w
