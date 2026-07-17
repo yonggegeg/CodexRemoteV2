@@ -21,6 +21,7 @@ struct RelayState: Decodable {
     let windows: [RemoteWindow]
     let slots: [WindowSlot]
     let threads: [RemoteThread]
+    let threadItems: [RemoteThreadItem]?
     let selectedThreadId: String?
     let time: String?
 }
@@ -77,6 +78,24 @@ struct RemoteThread: Identifiable, Decodable {
     let status: String?
     let updatedAt: String?
     let cwd: String?
+    let preview: String?
+}
+
+struct RemoteThreadItem: Identifiable, Decodable {
+    let id: String
+    let role: String?
+    let text: String
+    let createdAt: String?
+    let type: String?
+
+    var isUser: Bool {
+        let r = (role ?? "").lowercased()
+        return r.contains("user") || r == "input"
+    }
+}
+
+struct SelectThreadRequest: Encodable {
+    let threadId: String?
 }
 
 struct SelectWindowsRequest: Encodable {
@@ -149,4 +168,3 @@ struct QueuedMessage: Decodable {
     let text: String?
     let createdAt: String?
 }
-

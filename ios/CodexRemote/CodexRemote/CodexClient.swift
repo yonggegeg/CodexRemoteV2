@@ -11,6 +11,7 @@ final class RemoteClient: ObservableObject {
         WindowSlot(slot: "B", hwnd: nil, title: "窗口 B", imageBase64: nil, updatedAt: nil, error: nil)
     ]
     @Published var threads: [RemoteThread] = []
+    @Published var threadItems: [RemoteThreadItem] = []
     @Published var selectedThreadId: String?
     @Published var lastError: String?
     @Published var lastSendStatus: String?
@@ -44,6 +45,7 @@ final class RemoteClient: ObservableObject {
             windows = state.windows
             slots = state.slots.sorted { $0.slot < $1.slot }
             threads = state.threads
+            threadItems = state.threadItems ?? []
             selectedThreadId = state.selectedThreadId
             agentText = state.agent.online ? (state.agent.statusText ?? "Windows Agent 在线") : "Windows Agent 离线"
             lastError = nil
@@ -63,6 +65,35 @@ final class RemoteClient: ObservableObject {
             await refresh(settings: settings)
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    func selectThread(_ thread: RemoteThread, settings: AppSettings) async {
+        do {
+            let requestBody = SelectThreadRequest(threadId: thread.id)
+            let _: OKEnvelope = try await request(settings: settings, path: "/api/thread/select", method: "POST", body: requestBody)
+            selectedThreadId = thread.id
+            await refresh(settings: settings)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func sendMessage(_ text: String, kind: String = "normal", settings: AppSettings) async {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else {
+            lastError = "消息不能为空"
+            return
+        }
+        do {
+            lastSendStatus = kind == "steer" ? "正在发送引导消息…" : "正在发送消息…"
+            let msgReq = SendMessageRequest(threadId: selectedThreadId, text: cleanText, kind: kind, attachments: [])
+            let _: SendMessageEnvelope = try await request(settings: settings, path: "/api/messages/send", method: "POST", body: msgReq)
+            lastSendStatus = kind == "steer" ? "已发送引导消息" : "已发送消息"
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+            lastSendStatus = nil
         }
     }
 
@@ -106,16 +137,7 @@ final class RemoteClient: ObservableObject {
             lastError = "引导消息不能为空"
             return
         }
-        do {
-            lastSendStatus = "正在发送引导消息…"
-            let msgReq = SendMessageRequest(threadId: selectedThreadId, text: cleanText, kind: "steer", attachments: [])
-            let _: SendMessageEnvelope = try await request(settings: settings, path: "/api/messages/send", method: "POST", body: msgReq)
-            lastSendStatus = "已发送引导消息"
-            lastError = nil
-        } catch {
-            lastError = error.localizedDescription
-            lastSendStatus = nil
-        }
+        await sendMessage(cleanText, kind: "steer", settings: settings)
     }
 
     private func request<T: Decodable, B: Encodable>(settings: AppSettings, path: String, method: String, body: B?) async throws -> T {

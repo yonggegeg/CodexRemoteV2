@@ -26,6 +26,7 @@ let state = {
     { slot: 'B', hwnd: null, title: '窗口 B', imageBase64: null, updatedAt: null }
   ],
   threads: [],
+  threadItems: [],
   selectedThreadId: null,
   events: [],
   uploads: [],
@@ -91,6 +92,7 @@ function compactState() {
     windows: state.windows,
     slots: state.slots.map(s => ({ ...s, imageBase64: s.imageBase64 ? s.imageBase64 : null })),
     threads: state.threads,
+    threadItems: state.threadItems || [],
     selectedThreadId: state.selectedThreadId,
     time: now()
   };
@@ -215,7 +217,16 @@ const server = http.createServer(async (req, res) => {
           statusText: body.statusText || 'Windows Agent 在线'
         };
         if (Array.isArray(body.windows)) state.windows = body.windows;
-        if (Array.isArray(body.threads)) state.threads = body.threads;
+        if (Array.isArray(body.threads)) {
+          state.threads = body.threads;
+          if (!state.selectedThreadId && state.threads.length) {
+            state.selectedThreadId = state.threads[0].id;
+          }
+          if (state.selectedThreadId && !state.threads.some(t => t.id === state.selectedThreadId) && state.threads.length) {
+            state.selectedThreadId = state.threads[0].id;
+          }
+        }
+        if (Array.isArray(body.threadItems)) state.threadItems = body.threadItems;
         if (Array.isArray(body.slots)) {
           for (const incoming of body.slots) {
             const slot = state.slots.find(s => s.slot === incoming.slot);

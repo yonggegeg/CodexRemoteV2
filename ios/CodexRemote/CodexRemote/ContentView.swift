@@ -57,7 +57,7 @@ struct ThreadsView: View {
     @EnvironmentObject private var client: RemoteClient
     @State private var inputText: String = ""
     @State private var guideMode: Bool = false
-    @State private var selectedModel: String = "5.5 ?"
+    @State private var selectedModel: String = "GPT-5.5 高"
     @State private var showActionDrawer: Bool = false
 
     private let sampleMessages: [(String, String, Bool)] = [
@@ -74,9 +74,33 @@ struct ThreadsView: View {
                         VStack(alignment: .leading, spacing: 14) {
                             HeaderCard()
                             workspaceHeader
-                            ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
-                                ChatMessageCard(role: message.0, text: message.1, compact: message.2)
-                                    .id(index)
+                            if client.threadItems.isEmpty {
+                                ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
+                                    ChatMessageCard(role: message.0, text: message.1, compact: message.2)
+                                        .id(index)
+                                }
+                            } else {
+                                ForEach(client.threadItems) { item in
+                                    ChatMessageCard(role: item.isUser ? "user" : "codex", text: item.text, compact: item.type != nil)
+                                        .id(item.id)
+                                }
+                            }
+
+                            if !client.threads.isEmpty {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("电脑 Codex 任务")
+                                        .font(.headline)
+                                    ForEach(client.threads) { thread in
+                                        Button {
+                                            Task { await client.selectThread(thread, settings: settings) }
+                                        } label: {
+                                            ThreadRow(thread: thread, selected: thread.id == client.selectedThreadId)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(14)
+                                .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                             }
                             if let sendStatus = client.lastSendStatus {
                                 Label(sendStatus, systemImage: "paperplane.circle.fill")
@@ -262,7 +286,7 @@ struct ChatMessageCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(role == "user" ? "?" : "Codex")
+                Text(role == "user" ? "你" : "Codex")
                     .font(.caption.bold())
                     .foregroundStyle(role == "user" ? .blue : .secondary)
                 Spacer()
@@ -325,9 +349,9 @@ struct DesktopComposer: View {
                     .foregroundStyle(.orange)
                 Spacer()
                 Menu(selectedModel) {
-                    Button("5.5 ?") { selectedModel = "5.5 ?" }
-                    Button("5.5 ?") { selectedModel = "5.5 ?" }
-                    Button("5.5 ?") { selectedModel = "5.5 ?" }
+                    Button("GPT-5.5 高") { selectedModel = "GPT-5.5 高" }
+                    Button("GPT-5.5 中") { selectedModel = "GPT-5.5 中" }
+                    Button("GPT-5.5 低") { selectedModel = "GPT-5.5 低" }
                 }
                 .font(.caption)
                 Button(action: onSend) {
@@ -345,10 +369,11 @@ struct DesktopComposer: View {
 
 struct ThreadRow: View {
     let thread: RemoteThread
+    var selected: Bool = false
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "bubble.left.and.text.bubble.right.fill")
-                .foregroundStyle(.blue)
+                .foregroundStyle(selected ? .green : .blue)
                 .font(.title3)
             VStack(alignment: .leading, spacing: 4) {
                 Text(thread.title ?? "未命名会话")
@@ -360,6 +385,10 @@ struct ThreadRow: View {
                     .lineLimit(1)
             }
             Spacer()
+            if selected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
             Text(thread.status ?? "空闲")
                 .font(.caption.bold())
                 .padding(.horizontal, 8)
@@ -367,7 +396,7 @@ struct ThreadRow: View {
                 .background(Color(.tertiarySystemFill), in: Capsule())
         }
         .padding(12)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(selected ? Color.green.opacity(0.12) : Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -706,5 +735,3 @@ struct FilesPlaceholderView: View {
         .environmentObject(AppSettings())
         .environmentObject(RemoteClient())
 }
-
-
