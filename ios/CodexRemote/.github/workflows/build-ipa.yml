@@ -1,0 +1,28 @@
+﻿name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build unsigned IPA
+        working-directory: ios/CodexRemote
+        run: |
+          chmod +x scripts/build-unsigned-ipa.sh
+          scripts/build-unsigned-ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexRemote-unsigned-ipa
+          path: ios/CodexRemote/build/CodexRemote-unsigned.ipa

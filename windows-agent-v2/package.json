@@ -1,0 +1,12 @@
+﻿{
+  "name": "codex-remote-windows-agent-v2",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Windows agent for Codex Remote v2: window monitoring + Codex thread mirror skeleton.",
+  "scripts": {
+    "start": "node agent-v2.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
