@@ -26,6 +26,7 @@ struct RelayState: Decodable {
     let permissionProfiles: [CodexPermissionProfile]?
     let codexSettings: CodexSettings?
     let codexRuntime: CodexRuntime?
+    let historyCursor: String?
     let latestMessageStatus: RelayMessageStatus?
     let messageStatuses: [RelayMessageStatus]?
     let selectedThreadId: String?
@@ -66,6 +67,8 @@ struct WindowSlot: Identifiable, Decodable {
     let hwnd: String?
     let title: String?
     let imageBase64: String?
+    let imageHash: String?
+    let unchanged: Bool?
     let updatedAt: String?
     let error: String?
 
@@ -115,7 +118,7 @@ struct RemoteThreadItem: Identifiable, Decodable {
     }
 }
 
-struct RemoteFileChange: Identifiable, Decodable, Hashable {
+struct RemoteFileChange: Identifiable, Codable, Hashable {
     let path: String?
     let file: String?
     let kind: String?
@@ -199,22 +202,31 @@ struct RelayMessageStatus: Decodable, Hashable {
     var isError: Bool { status == "error" }
 }
 
-struct CodexRuntime: Codable, Hashable {
+struct CodexRuntime: Decodable, Hashable {
     let active: Bool?
     let activeTurnId: String?
     let threadId: String?
     let lastItemType: String?
     let plan: CodexPlanRuntime?
+    let historyCursor: String?
     let updatedAt: String?
 }
 
-struct CodexPlanRuntime: Codable, Hashable {
+struct CodexPlanRuntime: Decodable, Hashable {
     let currentStep: String?
     let currentIndex: Int?
     let total: Int?
     let completed: Int?
     let explanation: String?
+    let fileSummary: CodexPlanFileSummary?
     let updatedAt: String?
+}
+
+struct CodexPlanFileSummary: Decodable, Hashable {
+    let fileCount: Int?
+    let additions: Int?
+    let deletions: Int?
+    let files: [RemoteFileChange]?
 }
 
 struct InterruptCodexRequest: Encodable {
@@ -294,6 +306,27 @@ struct MessageAttachment: Codable {
 struct SendMessageEnvelope: Decodable {
     let ok: Bool
     let message: QueuedMessage?
+}
+
+struct HistoryRequestBody: Encodable {
+    let threadId: String?
+    let cursor: String?
+    let limit: Int
+}
+
+struct HistoryRequestEnvelope: Decodable {
+    let ok: Bool
+    let requestId: String?
+}
+
+struct HistoryResultEnvelope: Decodable {
+    let ok: Bool
+    let pending: Bool?
+    let id: String?
+    let threadId: String?
+    let items: [RemoteThreadItem]?
+    let nextCursor: String?
+    let error: String?
 }
 
 struct QueuedMessage: Decodable {

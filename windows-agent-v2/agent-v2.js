@@ -2,6 +2,7 @@ const os = require('os');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const RELAY_URL = (process.env.RELAY_URL || 'http://115.159.221.170:8080').replace(/\/$/, '');
 const AGENT_TOKEN = process.env.AGENT_TOKEN || 'change-me-agent-token';
@@ -9,6 +10,8 @@ const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-codex-agent-v2`;
 const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS || 1200);
 const LIST_INTERVAL_MS = Number(process.env.LIST_INTERVAL_MS || 3000);
 const CODEX_INTERVAL_MS = Number(process.env.CODEX_INTERVAL_MS || 2500);
+const REALTIME_THREAD_LIMIT = Number(process.env.REALTIME_THREAD_LIMIT || 70);
+const HISTORY_PAGE_LIMIT = Number(process.env.HISTORY_PAGE_LIMIT || 60);
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -131,15 +134,16 @@ class CodexAppServer {
     })).filter(t => t.id);
   }
 
-  async listThreadItems(threadId, limit = 80) {
+  async listThreadItemsPage(threadId, { limit = 80, cursor = null, sortDirection = 'desc' } = {}) {
     await this.initialize();
     try {
       const result = await this.request('thread/items/list', {
         threadId,
         limit,
-        sortDirection: 'asc'
+        cursor,
+        sortDirection
       });
-      return result.data || [];
+      return { items: result.data || [], nextCursor: result.nextCursor || null };
     } catch (err) {
       const result = await this.request('thread/read', { threadId, includeTurns: true });
       const turns = result.thread?.turns || [];
@@ -149,13 +153,20 @@ class CodexAppServer {
           items.push({ ...item, turnId: turn.id });
         }
       }
-      return items.slice(-limit);
+      const page = sortDirection === 'desc' ? items.slice(-limit).reverse() : items.slice(0, limit);
+      return { items: page, nextCursor: null };
     }
   }
 
-  simplifyThreadItems(items) {
+  async listThreadItems(threadId, limit = 80) {
+    const page = await this.listThreadItemsPage(threadId, { limit, sortDirection: 'desc' });
+    return page.items.slice().reverse();
+  }
+
+  simplifyThreadItems(items, options = {}) {
     const output = [];
     let pendingProcess = null;
+    const mergeFileTurnId = options.mergeFileTurnId || null;
 
     const flushProcess = (keepReasoningOnly = false) => {
       if (!pendingProcess) return;
@@ -197,9 +208,11 @@ class CodexAppServer {
       let text = '';
       const rawType = raw.type || item.type || null;
       const rawTypeLower = String(rawType || '').toLowerCase();
+      const turnId = item.turnId || raw.turnId || null;
 
       if (rawType === 'fileChange') {
         flushProcess(false);
+        if (mergeFileTurnId && turnId === mergeFileTurnId) continue;
         output.push(fileChangeSummaryItem(item, raw, index));
         continue;
       }
@@ -262,12 +275,17 @@ class CodexAppServer {
     const active = !!activeTurnId && activeTypes.has(lastType) && !finishedTypes.has(lastType);
     if (active && activeTurnId) this.activeTurns.set(threadId, activeTurnId);
     const planState = this.planRuntime(threadId, activeTurnId);
+    const fileSummary = fileSummaryForTurn(items, activeTurnId);
+    const mergedPlan = planState || fileSummary ? {
+      ...(planState || {}),
+      fileSummary: fileSummary || null
+    } : null;
     return {
       active,
       activeTurnId: active ? activeTurnId : null,
       threadId,
       lastItemType: last?.type || null,
-      plan: planState
+      plan: mergedPlan
     };
   }
 
@@ -533,6 +551,38 @@ function fileChangeSummaryItem(item, raw, index) {
   };
 }
 
+function fileSummaryForTurn(items, turnId) {
+  if (!turnId) return null;
+  const changes = [];
+  for (const item of items || []) {
+    const raw = item.item || item;
+    const itemTurnId = item.turnId || raw.turnId || null;
+    if (itemTurnId !== turnId || raw.type !== 'fileChange') continue;
+    for (const change of raw.changes || []) changes.push(change);
+  }
+  if (!changes.length) return null;
+  let additions = 0;
+  let deletions = 0;
+  const files = changes.slice(0, 4).map(change => {
+    const stats = diffStats(change.diff || '');
+    additions += stats.additions;
+    deletions += stats.deletions;
+    return {
+      path: change.path || null,
+      file: path.basename(change.path || 'unknown'),
+      kind: change.kind?.type || change.kind || 'update',
+      additions: stats.additions,
+      deletions: stats.deletions
+    };
+  });
+  for (const change of changes.slice(4)) {
+    const stats = diffStats(change.diff || '');
+    additions += stats.additions;
+    deletions += stats.deletions;
+  }
+  return { fileCount: changes.length, additions, deletions, files };
+}
+
 function summarizeFileChange(raw) {
   const changes = Array.isArray(raw.changes) ? raw.changes : [];
   const lines = changes.slice(0, 8).map(change => {
@@ -542,6 +592,10 @@ function summarizeFileChange(raw) {
   });
   const extra = changes.length > 8 ? `\n…另外 ${changes.length - 8} 个文件` : '';
   return `文件变更 ${changes.length} 个\n${lines.join('\n')}${extra}`;
+}
+
+function sha1(text) {
+  return crypto.createHash('sha1').update(String(text || '')).digest('hex');
 }
 
 async function api(path, options = {}) {
@@ -620,6 +674,18 @@ async function fetchPendingCommands() {
   return data.commands || [];
 }
 
+async function fetchPendingHistoryRequests() {
+  const data = await api('/agent/history/next');
+  return data.requests || [];
+}
+
+async function reportHistoryResult(result) {
+  await api('/agent/history/result', {
+    method: 'POST',
+    body: JSON.stringify(result)
+  });
+}
+
 function saveInboundMessages(messages) {
   const saved = [];
   if (!messages.length) return;
@@ -669,6 +735,36 @@ async function handleInboundCommands(commands) {
       }
     } catch (err) {
       console.error(`[codex] command ${command.id || command.type} failed: ${err.message}`);
+    }
+  }
+}
+
+async function handleHistoryRequests(requests) {
+  for (const req of requests || []) {
+    try {
+      const limit = Math.min(Math.max(Number(req.limit || HISTORY_PAGE_LIMIT), 1), 120);
+      const page = await codex.listThreadItemsPage(req.threadId, {
+        limit,
+        cursor: req.cursor || null,
+        sortDirection: 'desc'
+      });
+      const chronological = page.items.slice().reverse();
+      const runtime = codex.analyzeThreadRuntime(req.threadId, chronological);
+      const items = codex.simplifyThreadItems(chronological, { mergeFileTurnId: runtime.activeTurnId });
+      await reportHistoryResult({
+        id: req.id,
+        ok: true,
+        threadId: req.threadId,
+        items,
+        nextCursor: page.nextCursor || null
+      });
+    } catch (err) {
+      await reportHistoryResult({
+        id: req.id,
+        ok: false,
+        threadId: req.threadId,
+        error: err.message
+      });
     }
   }
 }
@@ -740,6 +836,8 @@ async function main() {
       }
       const commands = await fetchPendingCommands();
       await handleInboundCommands(commands);
+      const historyRequests = await fetchPendingHistoryRequests();
+      await handleHistoryRequests(historyRequests);
       const messages = await fetchPendingMessages();
       const handledMessages = await handleInboundMessages(messages);
       if (handledMessages) {
@@ -750,9 +848,11 @@ async function main() {
       let codexRuntime = { active: false, activeTurnId: null, threadId: control.selectedThreadId || null };
       if (control.selectedThreadId) {
         try {
-          const rawItems = await codex.listThreadItems(control.selectedThreadId, 80);
+          const page = await codex.listThreadItemsPage(control.selectedThreadId, { limit: REALTIME_THREAD_LIMIT, sortDirection: 'desc' });
+          const rawItems = page.items.slice().reverse();
           codexRuntime = codex.analyzeThreadRuntime(control.selectedThreadId, rawItems);
-          threadItems = codex.simplifyThreadItems(rawItems);
+          threadItems = codex.simplifyThreadItems(rawItems, { mergeFileTurnId: codexRuntime.activeTurnId });
+          codexRuntime.historyCursor = page.nextCursor || null;
         } catch (err) {
           console.error(`[codex] thread items failed: ${err.message}`);
         }
@@ -768,6 +868,7 @@ async function main() {
             hwnd: String(s.hwnd),
             title: shot.title || win?.title || `窗口 ${s.slot}`,
             imageBase64: shot.imageBase64,
+            imageHash: sha1(shot.imageBase64 || ''),
             updatedAt: shot.capturedAt
           });
         } catch (err) {

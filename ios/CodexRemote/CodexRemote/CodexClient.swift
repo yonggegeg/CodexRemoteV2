@@ -7,23 +7,29 @@ final class RemoteClient: ObservableObject {
     @Published var agentText = "未连接"
     @Published var windows: [RemoteWindow] = []
     @Published var slots: [WindowSlot] = [
-        WindowSlot(slot: "A", hwnd: nil, title: "窗口 A", imageBase64: nil, updatedAt: nil, error: nil),
-        WindowSlot(slot: "B", hwnd: nil, title: "窗口 B", imageBase64: nil, updatedAt: nil, error: nil)
+        WindowSlot(slot: "A", hwnd: nil, title: "窗口 A", imageBase64: nil, imageHash: nil, unchanged: nil, updatedAt: nil, error: nil),
+        WindowSlot(slot: "B", hwnd: nil, title: "窗口 B", imageBase64: nil, imageHash: nil, unchanged: nil, updatedAt: nil, error: nil)
     ]
     @Published var threads: [RemoteThread] = []
     @Published var threadItems: [RemoteThreadItem] = []
     @Published var modelCatalog: [CodexModel] = []
     @Published var permissionProfiles: [CodexPermissionProfile] = []
     @Published var codexSettings = CodexSettings(model: nil, reasoningEffort: nil, permissionMode: "ask", updatedAt: nil)
-    @Published var codexRuntime = CodexRuntime(active: false, activeTurnId: nil, threadId: nil, lastItemType: nil, plan: nil, updatedAt: nil)
+    @Published var codexRuntime = CodexRuntime(active: false, activeTurnId: nil, threadId: nil, lastItemType: nil, plan: nil, historyCursor: nil, updatedAt: nil)
     @Published var latestMessageStatus: RelayMessageStatus?
     @Published var selectedThreadId: String?
     @Published var lastError: String?
     @Published var lastSendStatus: String?
     @Published var isPolling = false
+    @Published var isLoadingOlder = false
+    @Published var hasMoreHistory = true
 
     private var pollTask: Task<Void, Never>?
     private var isInBackground = false
+    private var latestThreadItems: [RemoteThreadItem] = []
+    private var olderThreadItems: [RemoteThreadItem] = []
+    private var historyCursor: String?
+    private let maxDisplayedItems = 800
 
     func startPolling(settings: AppSettings) {
         isInBackground = false
@@ -56,12 +62,22 @@ final class RemoteClient: ObservableObject {
     func refresh(settings: AppSettings) async {
         guard !isInBackground else { return }
         do {
-            let state: RelayState = try await request(settings: settings, path: "/api/state", method: "GET", body: Optional<String>.none)
+            let query = slotHashQuery()
+            let state: RelayState = try await request(settings: settings, path: "/api/state\(query)", method: "GET", body: Optional<String>.none)
             isConnected = state.ok
             windows = state.windows
-            slots = state.slots.sorted { $0.slot < $1.slot }
+            slots = mergeSlots(state.slots.sorted { $0.slot < $1.slot })
             threads = state.threads
-            threadItems = state.threadItems ?? []
+            let threadChanged = selectedThreadId != state.selectedThreadId
+            if threadChanged {
+                olderThreadItems = []
+                latestThreadItems = []
+                threadItems = []
+            }
+            latestThreadItems = state.threadItems ?? []
+            historyCursor = state.historyCursor ?? state.codexRuntime?.historyCursor ?? (threadChanged ? nil : historyCursor)
+            hasMoreHistory = historyCursor != nil
+            publishMergedThreadItems()
             modelCatalog = state.modelCatalog ?? []
             permissionProfiles = state.permissionProfiles ?? []
             if let codexSettings = state.codexSettings {
@@ -106,7 +122,43 @@ final class RemoteClient: ObservableObject {
             let requestBody = SelectThreadRequest(threadId: thread.id)
             let _: OKEnvelope = try await request(settings: settings, path: "/api/thread/select", method: "POST", body: requestBody)
             selectedThreadId = thread.id
+            olderThreadItems = []
+            latestThreadItems = []
+            threadItems = []
+            historyCursor = nil
+            hasMoreHistory = true
             await refresh(settings: settings)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func loadOlderMessages(settings: AppSettings) async {
+        guard !isLoadingOlder, hasMoreHistory else { return }
+        guard let threadId = selectedThreadId else { return }
+        isLoadingOlder = true
+        defer { isLoadingOlder = false }
+        do {
+            let body = HistoryRequestBody(threadId: threadId, cursor: historyCursor, limit: 60)
+            let queued: HistoryRequestEnvelope = try await request(settings: settings, path: "/api/thread/history/request", method: "POST", body: body)
+            guard let requestId = queued.requestId else { throw RemoteClientError.badResponse("历史请求没有返回 requestId") }
+            var result: HistoryResultEnvelope?
+            for _ in 0..<30 {
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                let path = "/api/thread/history/result?id=\(requestId)"
+                let response: HistoryResultEnvelope = try await request(settings: settings, path: path, method: "GET", body: Optional<String>.none)
+                if response.pending == true { continue }
+                result = response
+                break
+            }
+            guard let result else { throw RemoteClientError.badResponse("读取历史消息超时") }
+            if result.ok == false { throw RemoteClientError.badResponse(result.error ?? "读取历史消息失败") }
+            let incoming = result.items ?? []
+            historyCursor = result.nextCursor
+            hasMoreHistory = result.nextCursor != nil && !incoming.isEmpty
+            olderThreadItems = mergeUnique(incoming + olderThreadItems)
+            publishMergedThreadItems()
+            lastError = nil
         } catch {
             lastError = error.localizedDescription
         }
@@ -245,6 +297,47 @@ final class RemoteClient: ObservableObject {
             throw RemoteClientError.badResponse(String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)")
         }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func publishMergedThreadItems() {
+        let merged = mergeUnique(olderThreadItems + latestThreadItems)
+        if merged.count > maxDisplayedItems {
+            threadItems = Array(merged.suffix(maxDisplayedItems))
+            olderThreadItems = Array(threadItems.dropLast(latestThreadItems.count))
+        } else {
+            threadItems = merged
+        }
+    }
+
+    private func mergeUnique(_ items: [RemoteThreadItem]) -> [RemoteThreadItem] {
+        var seen = Set<String>()
+        var result: [RemoteThreadItem] = []
+        for item in items {
+            if seen.insert(item.id).inserted {
+                result.append(item)
+            }
+        }
+        return result
+    }
+
+    private func slotHashQuery() -> String {
+        let pairs = slots.compactMap { slot -> String? in
+            guard let hash = slot.imageHash, !hash.isEmpty else { return nil }
+            return "\(slot.slot):\(hash)"
+        }
+        guard !pairs.isEmpty else { return "" }
+        return "?slotHashes=\(pairs.joined(separator: ","))"
+    }
+
+    private func mergeSlots(_ incoming: [WindowSlot]) -> [WindowSlot] {
+        incoming.map { slot in
+            if slot.unchanged == true,
+               slot.imageBase64 == nil,
+               let old = slots.first(where: { $0.slot == slot.slot }) {
+                return WindowSlot(slot: slot.slot, hwnd: slot.hwnd, title: slot.title, imageBase64: old.imageBase64, imageHash: slot.imageHash ?? old.imageHash, unchanged: slot.unchanged, updatedAt: slot.updatedAt, error: slot.error)
+            }
+            return slot
+        }
     }
 }
 

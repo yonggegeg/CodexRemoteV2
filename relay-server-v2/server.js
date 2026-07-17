@@ -8,6 +8,11 @@ const APP_TOKEN = process.env.APP_TOKEN || 'change-me-app-token';
 const AGENT_TOKEN = process.env.AGENT_TOKEN || 'change-me-agent-token';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'state.json');
+const MAX_REALTIME_ITEMS = Number(process.env.MAX_REALTIME_ITEMS || 60);
+const MAX_MESSAGE_STATUSES = Number(process.env.MAX_MESSAGE_STATUSES || 40);
+const MAX_UPLOADS = Number(process.env.MAX_UPLOADS || 30);
+const HISTORY_RESULT_TTL_MS = Number(process.env.HISTORY_RESULT_TTL_MS || 2 * 60 * 1000);
+const UPLOAD_TTL_MS = Number(process.env.UPLOAD_TTL_MS || 10 * 60 * 1000);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -45,6 +50,8 @@ let state = {
   uploads: [],
   pendingMessages: [],
   pendingCommands: [],
+  pendingHistoryRequests: [],
+  historyResults: [],
   messageStatuses: []
 };
 
@@ -58,7 +65,7 @@ function load() {
 
 function save() {
   const tmp = DATA_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(persistentState(), null, 2));
   fs.renameSync(tmp, DATA_FILE);
 }
 
@@ -100,20 +107,56 @@ function readBody(req) {
   });
 }
 
-function compactState() {
+function persistentState() {
+  return {
+    ...state,
+    slots: (state.slots || []).map(s => ({ ...s, imageBase64: null })),
+    threadItems: [],
+    uploads: [],
+    pendingHistoryRequests: [],
+    historyResults: []
+  };
+}
+
+function pruneTransient() {
+  const cutoffUpload = Date.now() - UPLOAD_TTL_MS;
+  state.uploads = (state.uploads || []).filter(u => Date.parse(u.createdAt || 0) >= cutoffUpload);
+  const cutoffHistory = Date.now() - HISTORY_RESULT_TTL_MS;
+  state.historyResults = (state.historyResults || []).filter(r => Date.parse(r.createdAt || 0) >= cutoffHistory);
+  if ((state.pendingHistoryRequests || []).length > 30) state.pendingHistoryRequests = state.pendingHistoryRequests.slice(-30);
+  if ((state.messageStatuses || []).length > MAX_MESSAGE_STATUSES) state.messageStatuses = state.messageStatuses.slice(-MAX_MESSAGE_STATUSES);
+}
+
+function knownSlotHashes(url) {
+  const result = {};
+  const raw = url.searchParams.get('slotHashes') || '';
+  for (const part of raw.split(',')) {
+    const [slot, hash] = part.split(':');
+    if (slot && hash) result[slot] = hash;
+  }
+  return result;
+}
+
+function compactState(url) {
+  pruneTransient();
+  const knownHashes = knownSlotHashes(url);
   return {
     ok: true,
     agent: state.agent,
     windows: state.windows,
-    slots: state.slots.map(s => ({ ...s, imageBase64: s.imageBase64 ? s.imageBase64 : null })),
+    slots: state.slots.map(s => {
+      const unchanged = s.imageHash && knownHashes[s.slot] === s.imageHash;
+      return { ...s, imageBase64: unchanged ? null : (s.imageBase64 || null), unchanged };
+    }),
     threads: state.threads,
-    threadItems: state.threadItems || [],
+    threadItems: (state.threadItems || []).slice(-MAX_REALTIME_ITEMS),
     selectedThreadId: state.selectedThreadId,
     modelCatalog: state.modelCatalog || [],
     permissionProfiles: state.permissionProfiles || [],
     codexSettings: state.codexSettings || {},
     codexRuntime: state.codexRuntime || {},
     latestMessageStatus: (state.messageStatuses || [])[state.messageStatuses.length - 1] || null,
+    historyCursor: state.codexRuntime?.historyCursor || null,
     messageStatuses: (state.messageStatuses || []).slice(-20),
     time: now()
   };
@@ -132,7 +175,7 @@ function setMessageStatus(id, patch) {
   const existing = state.messageStatuses.find(m => m.id === id);
   if (existing) Object.assign(existing, patch, { updatedAt: now() });
   else state.messageStatuses.push({ id, ...patch, updatedAt: now() });
-  if (state.messageStatuses.length > 80) state.messageStatuses = state.messageStatuses.slice(-80);
+  if (state.messageStatuses.length > MAX_MESSAGE_STATUSES) state.messageStatuses = state.messageStatuses.slice(-MAX_MESSAGE_STATUSES);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -147,7 +190,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/')) {
       if (!auth(req, 'app')) return send(res, 401, { ok: false, error: 'unauthorized app token' });
 
-      if (req.method === 'GET' && url.pathname === '/api/state') return send(res, 200, compactState());
+      if (req.method === 'GET' && url.pathname === '/api/state') return send(res, 200, compactState(url));
       if (req.method === 'GET' && url.pathname === '/api/windows') return send(res, 200, { ok: true, windows: state.windows, slots: state.slots, agent: state.agent });
       if (req.method === 'GET' && url.pathname === '/api/threads') return send(res, 200, { ok: true, threads: state.threads, selectedThreadId: state.selectedThreadId, agent: state.agent });
       if (req.method === 'POST' && url.pathname === '/api/codex/settings') {
@@ -174,9 +217,35 @@ const server = http.createServer(async (req, res) => {
           createdAt: now()
         };
         state.uploads.push(upload);
-        if (state.uploads.length > 100) state.uploads = state.uploads.slice(-100);
+        if (state.uploads.length > MAX_UPLOADS) state.uploads = state.uploads.slice(-MAX_UPLOADS);
         save();
         return send(res, 200, { ok: true, upload: { id: upload.id, fileName: upload.fileName, mimeType: upload.mimeType, createdAt: upload.createdAt } });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/thread/history/request') {
+        const body = await readBody(req);
+        const request = {
+          id: makeId('hist'),
+          threadId: body.threadId || state.selectedThreadId || null,
+          cursor: body.cursor || state.codexRuntime?.historyCursor || null,
+          limit: Math.min(Math.max(Number(body.limit || 60), 1), 120),
+          createdAt: now()
+        };
+        if (!request.threadId) return send(res, 400, { ok: false, error: 'threadId is required' });
+        state.pendingHistoryRequests.push(request);
+        pushEvent('historyRequested', { id: request.id, threadId: request.threadId });
+        save();
+        return send(res, 200, { ok: true, requestId: request.id });
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/thread/history/result') {
+        pruneTransient();
+        const id = url.searchParams.get('id');
+        const idx = (state.historyResults || []).findIndex(r => r.id === id);
+        if (idx < 0) return send(res, 202, { ok: true, pending: true });
+        const result = state.historyResults.splice(idx, 1)[0];
+        save();
+        return send(res, 200, result);
       }
 
       if (req.method === 'POST' && url.pathname === '/api/messages/send') {
@@ -258,14 +327,17 @@ const server = http.createServer(async (req, res) => {
       
       if (req.method === 'GET' && url.pathname === '/agent/messages/next') {
         const rawMessages = state.pendingMessages.splice(0, 10);
+        const consumedUploadIds = new Set();
         for (const m of rawMessages) setMessageStatus(m.id, { status: 'deliveredToAgent', threadId: m.threadId, kind: m.kind, error: null });
         const messages = rawMessages.map(m => ({
           ...m,
           attachments: (m.attachments || []).map(a => {
             const upload = state.uploads.find(u => u.id === a.id);
+            if (upload) consumedUploadIds.add(upload.id);
             return upload ? { ...a, dataBase64: upload.dataBase64, mimeType: upload.mimeType, fileName: upload.fileName } : a;
           })
         }));
+        if (consumedUploadIds.size) state.uploads = state.uploads.filter(u => !consumedUploadIds.has(u.id));
         if (messages.length) save();
         return send(res, 200, { ok: true, messages });
       }
@@ -273,6 +345,20 @@ const server = http.createServer(async (req, res) => {
         const commands = state.pendingCommands.splice(0, 10);
         if (commands.length) save();
         return send(res, 200, { ok: true, commands });
+      }
+
+      if (req.method === 'GET' && url.pathname === '/agent/history/next') {
+        const requests = state.pendingHistoryRequests.splice(0, 5);
+        if (requests.length) save();
+        return send(res, 200, { ok: true, requests });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/agent/history/result') {
+        const body = await readBody(req);
+        state.historyResults.push({ ...body, createdAt: now() });
+        if (state.historyResults.length > 10) state.historyResults = state.historyResults.slice(-10);
+        save();
+        return send(res, 200, { ok: true });
       }
 
       if (req.method === 'POST' && url.pathname === '/agent/messages/status') {
@@ -311,7 +397,7 @@ const server = http.createServer(async (req, res) => {
             state.selectedThreadId = state.threads[0].id;
           }
         }
-        if (Array.isArray(body.threadItems)) state.threadItems = body.threadItems;
+        if (Array.isArray(body.threadItems)) state.threadItems = body.threadItems.slice(-MAX_REALTIME_ITEMS);
         if (Array.isArray(body.modelCatalog)) state.modelCatalog = body.modelCatalog;
         if (Array.isArray(body.permissionProfiles)) state.permissionProfiles = body.permissionProfiles;
         if (body.codexSettings) state.codexSettings = { ...state.codexSettings, ...body.codexSettings };
@@ -323,6 +409,7 @@ const server = http.createServer(async (req, res) => {
             slot.hwnd = incoming.hwnd == null ? slot.hwnd : String(incoming.hwnd);
             slot.title = incoming.title || slot.title;
             slot.imageBase64 = incoming.imageBase64 || slot.imageBase64;
+            slot.imageHash = incoming.imageHash || slot.imageHash || null;
             slot.updatedAt = incoming.updatedAt || now();
             slot.error = incoming.error || null;
           }

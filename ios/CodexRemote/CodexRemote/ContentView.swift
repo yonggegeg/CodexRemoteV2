@@ -228,12 +228,18 @@ struct ThreadsView: View {
                         VStack(alignment: .leading, spacing: 14) {
                             HeaderCard()
                             workspaceHeader
+                            if !client.threadItems.isEmpty && client.hasMoreHistory {
+                                LoadOlderMessagesView(isLoading: client.isLoadingOlder) {
+                                    Task { await client.loadOlderMessages(settings: settings) }
+                                }
+                            }
                             if client.threadItems.isEmpty {
                                 ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
                                     ChatMessageCard(role: message.0, text: message.1, compact: message.2, assistantName: assistantDisplayName)
                                         .id(index)
                                 }
                             } else {
+                                HistoryLoadRow()
                                 ForEach(client.threadItems) { item in
                                     ThreadItemCard(item: item, assistantName: assistantDisplayName) { image in
                                         previewImage = image
@@ -442,6 +448,37 @@ struct ThreadsView: View {
 
 
 
+
+struct HistoryLoadRow: View {
+    @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var client: RemoteClient
+
+    var body: some View {
+        if client.hasMoreHistory {
+            Button {
+                Task { await client.loadOlderMessages(settings: settings) }
+            } label: {
+                HStack(spacing: 8) {
+                    if client.isLoadingOlder {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.up.circle")
+                    }
+                    Text(client.isLoadingOlder ? "正在加载更早消息…" : "加载更早消息")
+                        .font(.caption.weight(.semibold))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+}
+
 struct ActionDrawerView: View {
     @Environment(\.dismiss) private var dismiss
 
@@ -557,6 +594,32 @@ struct ChatMessageCard: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color(.separator).opacity(0.25), lineWidth: 1)
         )
+    }
+}
+
+struct LoadOlderMessagesView: View {
+    let isLoading: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "clock.arrow.circlepath")
+                }
+                Text(isLoading ? "正在从电脑读取更早消息…" : "加载更早消息")
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(Color(.secondarySystemBackground), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isLoading)
     }
 }
 
@@ -1151,6 +1214,22 @@ struct PlanStatusStrip: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            if let summary = plan.fileSummary, (summary.fileCount ?? 0) > 0 {
+                Divider()
+                    .frame(height: 14)
+                Text("\(summary.fileCount ?? 0) 个文件")
+                    .font(.caption.weight(.semibold))
+                if let additions = summary.additions, additions > 0 {
+                    Text("+\(additions)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+                if let deletions = summary.deletions, deletions > 0 {
+                    Text("-\(deletions)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
             }
         }
         .padding(.horizontal, 12)
