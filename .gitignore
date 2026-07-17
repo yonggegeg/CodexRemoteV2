@@ -1,0 +1,3 @@
+windows-agent-v2/inbound-messages/
+relay-server-v2/data/
+*.log
