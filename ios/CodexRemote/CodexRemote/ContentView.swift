@@ -834,17 +834,22 @@ struct ImageStrip: View {
                             }
                             .buttonStyle(.plain)
                         } else {
-                            VStack(spacing: 6) {
-                                Image(systemName: "photo")
-                                    .font(.title3)
-                                Text(image.error ?? image.fileName ?? "图片")
-                                    .font(.caption2)
-                                    .lineLimit(2)
-                                    .multilineTextAlignment(.center)
+                            Button {
+                                onOpen(image)
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Image(systemName: image.hasRemoteData == true || image.url != nil ? "photo.badge.arrow.down" : "photo")
+                                        .font(.title3)
+                                    Text(image.error ?? image.fileName ?? "图片")
+                                        .font(.caption2)
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.center)
+                                }
+                                .foregroundStyle(.secondary)
+                                .frame(width: 96, height: 96)
+                                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                             }
-                            .foregroundStyle(.secondary)
-                            .frame(width: 96, height: 96)
-                            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -855,19 +860,28 @@ struct ImageStrip: View {
 
 struct ImagePreviewView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var client: RemoteClient
     let image: RemoteThreadImage
+    @State private var loadedImage: RemoteThreadImage?
+    @State private var loadError: String?
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let uiImage = image.image {
+            if let uiImage = (loadedImage ?? image).image {
                 ZoomableImage(image: uiImage)
                     .ignoresSafeArea()
             } else {
                 VStack(spacing: 12) {
-                    Image(systemName: "photo")
-                        .font(.system(size: 44))
-                    Text(image.error ?? image.fileName ?? "图片无法预览")
+                    if image.hasRemoteData == true || image.url != nil {
+                        ProgressView()
+                            .tint(.white)
+                    } else {
+                        Image(systemName: "photo")
+                            .font(.system(size: 44))
+                    }
+                    Text(loadError ?? image.error ?? image.fileName ?? "图片无法预览")
                         .font(.subheadline)
                 }
                 .foregroundStyle(.white.opacity(0.82))
@@ -893,6 +907,14 @@ struct ImagePreviewView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 Spacer()
+            }
+        }
+        .task {
+            guard loadedImage == nil else { return }
+            do {
+                loadedImage = try await client.loadThreadImage(image, settings: settings)
+            } catch {
+                loadError = error.localizedDescription
             }
         }
     }

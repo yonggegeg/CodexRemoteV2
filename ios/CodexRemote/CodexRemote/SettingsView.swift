@@ -26,6 +26,11 @@ struct SettingsView: View {
                 }
 
                 Section(header: Text("刷新")) {
+                    Toggle("省流量模式", isOn: $settings.lowDataMode)
+                    Text("开启后列表同步只传文字、状态和图片索引；点开图片时才单独加载。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
                     Slider(value: $settings.refreshSeconds, in: 0.7...5.0, step: 0.1) {
                         Text("刷新间隔")
                     }

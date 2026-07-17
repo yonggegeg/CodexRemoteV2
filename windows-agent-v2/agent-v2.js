@@ -196,7 +196,7 @@ class CodexAppServer {
       if (raw.type === 'fileChange') pendingProcess.fileCount += Math.max(1, (raw.changes || []).length);
       else if (rawType.includes('command')) pendingProcess.commandCount += 1;
       else if (raw.type === 'reasoning') {
-        if (Array.isArray(raw.summary) && raw.summary.length) pendingProcess.latestText = cleanStatusText(raw.summary.join(' '));
+        if (Array.isArray(raw.summary) && raw.summary.length) pendingProcess.latestText = compactStatusSummary(raw.summary);
         else pendingProcess.latestText = '正在处理';
       }
     };
@@ -505,6 +505,13 @@ function cleanStatusText(text) {
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function compactStatusSummary(summary) {
+  const parts = (summary || []).map(cleanStatusText).filter(Boolean).slice(-4);
+  const text = parts.join(' · ') || '正在处理';
+  if (text.length <= 260) return text;
+  return `…${text.slice(-259)}`;
 }
 
 function diffStats(diff) {

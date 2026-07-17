@@ -4,7 +4,8 @@ import SwiftUI
 final class AppSettings: ObservableObject {
     @AppStorage("serverURL") var serverURL: String = "http://115.159.221.170:8080" { willSet { objectWillChange.send() } }
     @AppStorage("appToken") var appToken: String = "" { willSet { objectWillChange.send() } }
-    @AppStorage("refreshSeconds") var refreshSeconds: Double = 0.8 { willSet { objectWillChange.send() } }
+    @AppStorage("refreshSeconds") var refreshSeconds: Double = 1.5 { willSet { objectWillChange.send() } }
+    @AppStorage("lowDataMode") var lowDataMode: Bool = true { willSet { objectWillChange.send() } }
 }
 
 struct RelayHealth: Decodable {
@@ -17,10 +18,16 @@ struct RelayHealth: Decodable {
 
 struct RelayState: Decodable {
     let ok: Bool
+    let notModified: Bool?
+    let stateHash: String?
+    let modelCatalogHash: String?
+    let permissionProfilesHash: String?
+    let threadsHash: String?
+    let windowsHash: String?
     let agent: AgentStatus
-    let windows: [RemoteWindow]
-    let slots: [WindowSlot]
-    let threads: [RemoteThread]
+    let windows: [RemoteWindow]?
+    let slots: [WindowSlot]?
+    let threads: [RemoteThread]?
     let threadItems: [RemoteThreadItem]?
     let modelCatalog: [CodexModel]?
     let permissionProfiles: [CodexPermissionProfile]?
@@ -90,7 +97,7 @@ struct RemoteThread: Identifiable, Decodable {
     let preview: String?
 }
 
-struct RemoteThreadItem: Identifiable, Decodable {
+struct RemoteThreadItem: Identifiable, Codable {
     let id: String
     let role: String?
     let text: String
@@ -128,7 +135,7 @@ struct RemoteFileChange: Identifiable, Codable, Hashable {
     var id: String { path ?? file ?? "change" }
 }
 
-struct RemoteThreadImage: Identifiable, Decodable {
+struct RemoteThreadImage: Identifiable, Codable {
     let id: String
     let fileName: String?
     let mimeType: String?
@@ -136,6 +143,7 @@ struct RemoteThreadImage: Identifiable, Decodable {
     let dataBase64: String?
     let url: String?
     let error: String?
+    let hasRemoteData: Bool?
 
     var image: UIImage? {
         guard let dataBase64, let data = Data(base64Encoded: dataBase64) else { return nil }
@@ -212,7 +220,12 @@ struct CodexRuntime: Decodable, Hashable {
     let updatedAt: String?
 }
 
-struct CodexPlanRuntime: Decodable, Hashable {
+struct ThreadImageEnvelope: Decodable {
+    let ok: Bool
+    let image: RemoteThreadImage?
+}
+
+struct CodexPlanRuntime: Codable, Hashable {
     let currentStep: String?
     let currentIndex: Int?
     let total: Int?
@@ -222,7 +235,7 @@ struct CodexPlanRuntime: Decodable, Hashable {
     let updatedAt: String?
 }
 
-struct CodexPlanFileSummary: Decodable, Hashable {
+struct CodexPlanFileSummary: Codable, Hashable {
     let fileCount: Int?
     let additions: Int?
     let deletions: Int?
