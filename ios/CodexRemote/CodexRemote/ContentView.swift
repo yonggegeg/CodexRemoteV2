@@ -1,8 +1,111 @@
 import SwiftUI
 import UIKit
+import PhotosUI
 
 private func hideKeyboard() {
     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+}
+
+private struct KeyboardDismissToolbarModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content.toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button {
+                    hideKeyboard()
+                } label: {
+                    Image(systemName: "keyboard.chevron.compact.down")
+                }
+                .accessibilityLabel("收起键盘")
+            }
+        }
+    }
+}
+
+private extension View {
+    func globalKeyboardDismissToolbar() -> some View {
+        modifier(KeyboardDismissToolbarModifier())
+    }
+}
+
+private struct KeyboardAccessoryInstaller: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: .zero)
+        context.coordinator.start()
+        DispatchQueue.main.async { context.coordinator.install() }
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        DispatchQueue.main.async { context.coordinator.install() }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    final class Coordinator {
+        private let toolbarTag = 778899
+        private var observers: [NSObjectProtocol] = []
+
+        func start() {
+            guard observers.isEmpty else { return }
+            let center = NotificationCenter.default
+            observers.append(center.addObserver(forName: UIResponder.keyboardWillShowNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.install()
+            })
+            observers.append(center.addObserver(forName: UITextView.textDidBeginEditingNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.install()
+            })
+            observers.append(center.addObserver(forName: UITextField.textDidBeginEditingNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.install()
+            })
+        }
+
+        deinit {
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
+
+        func install() {
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            for scene in scenes {
+                for window in scene.windows {
+                    install(in: window)
+                }
+            }
+        }
+
+        private func install(in view: UIView) {
+            if let textView = view as? UITextView {
+                if textView.inputAccessoryView?.tag != toolbarTag {
+                    textView.inputAccessoryView = makeToolbar()
+                    textView.reloadInputViews()
+                }
+            } else if let textField = view as? UITextField {
+                if textField.inputAccessoryView?.tag != toolbarTag {
+                    textField.inputAccessoryView = makeToolbar()
+                    textField.reloadInputViews()
+                }
+            }
+            for subview in view.subviews {
+                install(in: subview)
+            }
+        }
+
+        private func makeToolbar() -> UIToolbar {
+            let toolbar = UIToolbar()
+            toolbar.tag = toolbarTag
+            toolbar.sizeToFit()
+            let flex = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
+            let item = UIBarButtonItem(image: UIImage(systemName: "keyboard.chevron.compact.down"), style: .plain, target: self, action: #selector(dismissKeyboard))
+            toolbar.items = [flex, item]
+            return toolbar
+        }
+
+        @objc private func dismissKeyboard() {
+            hideKeyboard()
+        }
+    }
 }
 
 private func reasoningLabel(_ effort: String?) -> String {
@@ -30,6 +133,7 @@ private func permissionLabel(_ mode: String?) -> String {
 struct RootView: View {
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var client: RemoteClient
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView {
@@ -43,6 +147,20 @@ struct RootView: View {
                 .tabItem { Label("设置", systemImage: "gearshape.fill") }
         }
         .task { client.startPolling(settings: settings) }
+        .background(KeyboardAccessoryInstaller().frame(width: 0, height: 0))
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .active:
+                client.startPolling(settings: settings)
+                Task { await client.refresh(settings: settings) }
+            case .background:
+                client.pauseForBackground()
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
     }
 }
 
@@ -83,14 +201,16 @@ struct ThreadsView: View {
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var client: RemoteClient
     @State private var inputText: String = ""
-    @State private var guideMode: Bool = false
     @State private var selectedModel: String = "gpt-5.5"
     @State private var selectedReasoning: String = "high"
-    @State private var permissionMode: String = "full"
+    @State private var permissionMode: String = "ask"
     @State private var showActionDrawer: Bool = false
     @State private var showTaskSwitcher: Bool = false
     @State private var followLatest: Bool = true
     @State private var hasNewMessages: Bool = false
+    @State private var previewImage: RemoteThreadImage?
+    @State private var showPhotoPicker: Bool = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
 
     private let sampleMessages: [(String, String, Bool)] = [
         ("user", "我需要手机 App 能同步电脑 Codex 当前对话，并且可以随时发送引导消息纠正操作。", false),
@@ -115,7 +235,9 @@ struct ThreadsView: View {
                                 }
                             } else {
                                 ForEach(client.threadItems) { item in
-                                    ThreadItemCard(item: item, assistantName: assistantDisplayName)
+                                    ThreadItemCard(item: item, assistantName: assistantDisplayName) { image in
+                                        previewImage = image
+                                    }
                                         .id(item.id)
                                 }
                             }
@@ -151,13 +273,16 @@ struct ThreadsView: View {
                             hasNewMessages = false
                             scrollToLatest(proxy, delay: 0)
                         } label: {
-                            Label("跳到最新", systemImage: "arrow.down.circle.fill")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(.ultraThinMaterial, in: Capsule())
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .overlay(Circle().stroke(Color(.separator).opacity(0.35), lineWidth: 1))
+                                .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
                         }
-                        .padding(.bottom, 10)
+                        .buttonStyle(.plain)
+                        .padding(.bottom, 12)
                     }
                     }
                     .background(Color(.systemGroupedBackground))
@@ -175,12 +300,14 @@ struct ThreadsView: View {
                 }
                 DesktopComposer(
                     text: $inputText,
-                    guideMode: $guideMode,
+                    isRunning: client.codexRuntime.active == true,
+                    plan: client.codexRuntime.plan,
                     selectedModel: $selectedModel,
                     selectedReasoning: $selectedReasoning,
                     permissionMode: $permissionMode,
                     onSend: sendText,
-                    onImage: { }
+                    onStop: stopCurrentTurn,
+                    onImage: { showPhotoPicker = true }
                 )
             }
             .navigationTitle("iOS Codex 控制器")
@@ -204,6 +331,13 @@ struct ThreadsView: View {
             }
             .sheet(isPresented: $showTaskSwitcher) {
                 TaskSwitcherView()
+            }
+            .fullScreenCover(item: $previewImage) { image in
+                ImagePreviewView(image: image)
+            }
+            .photosPicker(isPresented: $showPhotoPicker, selection: $selectedPhotoItems, maxSelectionCount: 6, matching: .images)
+            .onChange(of: selectedPhotoItems.map { $0.itemIdentifier ?? "" }) { _ in
+                sendPickedPhotos(selectedPhotoItems)
             }
             .onReceive(client.$codexSettings) { settings in
                 if let model = settings.model { selectedModel = model }
@@ -253,11 +387,34 @@ struct ThreadsView: View {
         hideKeyboard()
         followLatest = true
         Task {
-            if guideMode {
+            if client.codexRuntime.active == true {
                 await client.sendGuideMessage(outgoing, settings: settings)
             } else {
-                await client.sendGuideMessage(outgoing, settings: settings)
+                await client.sendMessage(outgoing, settings: settings)
             }
+        }
+    }
+
+    private func stopCurrentTurn() {
+        hideKeyboard()
+        Task { await client.interruptCodex(settings: settings) }
+    }
+
+    private func sendPickedPhotos(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        let note = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        inputText = ""
+        followLatest = true
+        selectedPhotoItems = []
+        Task {
+            var uploads: [UploadRequest] = []
+            for (index, item) in items.enumerated() {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    uploads.append(UploadRequest(fileName: "iphone-photo-\(Int(Date().timeIntervalSince1970))-\(index).jpg", mimeType: "image/jpeg", dataBase64: data.base64EncodedString()))
+                }
+            }
+            let text = note.isEmpty ? "请查看我从手机发送的图片。" : note
+            await client.sendMessageWithUploads(text, uploads: uploads, settings: settings)
         }
     }
 
@@ -292,22 +449,18 @@ struct ActionDrawerView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    HStack(spacing: 12) {
-                        Button { } label: { Label("Image", systemImage: "gearshape") }
-                            .buttonStyle(.borderedProminent)
-                    }
                     drawerGroup {
                         DrawerRow(icon: "square.and.pencil", title: "新建任务", subtitle: "从手机创建新的 Codex 任务")
                         DrawerRow(icon: "clock", title: "定时任务", subtitle: "查看自动化和计划任务")
                         DrawerRow(icon: "powerplug", title: "插件", subtitle: "管理 Codex 插件")
                         DrawerRow(icon: "point.3.connected.trianglepath.dotted", title: "Pull Request", subtitle: "查看 Pull Request 工作流")
                     }
-                    drawerSectionTitle("Image")
+                    drawerSectionTitle("桌面端")
                     drawerGroup {
                         DrawerRow(icon: "folder", title: "文件功能预留", subtitle: "后续显示文件、diff 和日志")
                         DrawerRow(icon: "link", title: "连接桌面端", subtitle: "绑定电脑 Codex 远程控制")
                     }
-                    drawerSectionTitle("Image")
+                    drawerSectionTitle("当前")
                     drawerGroup {
                         DrawerRow(icon: "bubble.left.and.bubble.right", title: "iOS Codex 控制器", subtitle: "当前任务", selected: true)
                     }
@@ -315,7 +468,6 @@ struct ActionDrawerView: View {
                     drawerGroup {
                         DrawerRow(icon: "rectangle.on.rectangle", title: "双窗口监看", subtitle: "同时查看两个电脑窗口")
                         DrawerRow(icon: "camera.viewfinder", title: "发送截图", subtitle: "把软件窗口作为图片发给 Codex")
-                        DrawerRow(icon: "arrow.triangle.turn.up.right.circle", title: "引导消息", subtitle: "纠正正在运行的 Codex")
                         DrawerRow(icon: "shield.lefthalf.filled", title: "权限 / 模型", subtitle: "调整模型和审批模式")
                     }
                 }
@@ -324,7 +476,7 @@ struct ActionDrawerView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("更多")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Image") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
         }
         .presentationDetents([.large])
     }
@@ -411,6 +563,7 @@ struct ChatMessageCard: View {
 struct ThreadItemCard: View {
     let item: RemoteThreadItem
     let assistantName: String
+    let onOpenImage: (RemoteThreadImage) -> Void
 
     var body: some View {
         if item.isStatus {
@@ -435,7 +588,7 @@ struct ThreadItemCard: View {
                 if !item.text.isEmpty {
                     RichMessageText(text: item.text)
                 }
-                ImageStrip(images: item.images ?? [])
+                ImageStrip(images: item.images ?? [], onOpen: onOpenImage)
             }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -566,49 +719,70 @@ struct StatusItemView: View {
     let item: RemoteThreadItem
 
     var body: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .scaleEffect(0.72)
-            Text(item.text.isEmpty ? "正在处理" : item.text)
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "terminal")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer()
+                .padding(.top, 2)
+            Text(cleanStatusDisplayText(item.text.isEmpty ? "正在处理" : item.text))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color(.secondarySystemBackground), in: Capsule())
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
     }
+}
+
+private func cleanStatusDisplayText(_ text: String) -> String {
+    text
+        .replacingOccurrences(of: "**", with: "")
+        .replacingOccurrences(of: "`", with: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 struct FileChangeItemView: View {
     let item: RemoteThreadItem
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "doc.badge.gearshape")
-                .font(.title3)
-                .foregroundStyle(.green)
-                .frame(width: 32, height: 32)
-                .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            VStack(alignment: .leading, spacing: 4) {
-                Text("文件变更")
-                    .font(.subheadline.bold())
-                Text(item.text)
-                    .font(.caption)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "doc.badge.gearshape")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .lineLimit(5)
+                Text("\(item.fileCount ?? 1) 个文件已更改")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                if let additions = item.additions, additions > 0 {
+                    Text("+\(additions)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+                if let deletions = item.deletions, deletions > 0 {
+                    Text("-\(deletions)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer()
+            if let first = item.files?.first {
+                Text("• \(first.kind ?? "update"): \(first.file ?? first.path ?? "文件")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
-        .padding(12)
-        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color(.separator).opacity(0.22), lineWidth: 1))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 struct ImageStrip: View {
     let images: [RemoteThreadImage]
+    let onOpen: (RemoteThreadImage) -> Void
 
     var body: some View {
         if !images.isEmpty {
@@ -616,12 +790,17 @@ struct ImageStrip: View {
                 HStack(spacing: 8) {
                     ForEach(images) { image in
                         if let uiImage = image.image {
-                            Image(uiImage: uiImage)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 96, height: 96)
-                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color(.separator).opacity(0.3), lineWidth: 1))
+                            Button {
+                                onOpen(image)
+                            } label: {
+                                Image(uiImage: uiImage)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 96, height: 96)
+                                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color(.separator).opacity(0.3), lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
                         } else {
                             VStack(spacing: 6) {
                                 Image(systemName: "photo")
@@ -637,6 +816,51 @@ struct ImageStrip: View {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+struct ImagePreviewView: View {
+    @Environment(\.dismiss) private var dismiss
+    let image: RemoteThreadImage
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let uiImage = image.image {
+                ZoomableImage(image: uiImage)
+                    .ignoresSafeArea()
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 44))
+                    Text(image.error ?? image.fileName ?? "图片无法预览")
+                        .font(.subheadline)
+                }
+                .foregroundStyle(.white.opacity(0.82))
+            }
+
+            VStack {
+                HStack {
+                    Text(image.fileName ?? "图片")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.75))
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 34, height: 34)
+                            .background(Color.white.opacity(0.16), in: Circle())
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                Spacer()
             }
         }
     }
@@ -676,7 +900,7 @@ struct TaskSwitcherView: View {
     }
 }
 
-struct ModelReasoningMenu: View {
+struct ModelMenu: View {
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var client: RemoteClient
     @Binding var selectedModel: String
@@ -685,6 +909,50 @@ struct ModelReasoningMenu: View {
     private var selectedModelTitle: String {
         client.modelCatalog.first(where: { $0.id == selectedModel })?.title ?? selectedModel
     }
+
+    var body: some View {
+        Menu {
+            if client.modelCatalog.isEmpty {
+                Text("等待电脑端模型列表")
+            } else {
+                ForEach(client.modelCatalog) { model in
+                    Button {
+                        selectedModel = model.id
+                        let effort = model.supportedReasoningEfforts?.contains(where: { $0.id == selectedReasoning }) == true
+                            ? selectedReasoning
+                            : (model.defaultReasoningEffort ?? model.supportedReasoningEfforts?.first?.id ?? selectedReasoning)
+                        selectedReasoning = effort
+                        Task { await client.updateCodexSettings(model: model.id, reasoningEffort: effort, permissionMode: nil, settings: settings) }
+                    } label: {
+                        if model.id == selectedModel {
+                            Label(model.title, systemImage: "checkmark")
+                        } else {
+                            Text(model.title)
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text(selectedModelTitle)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                Image(systemName: "chevron.down")
+                    .font(.caption2)
+            }
+            .font(.caption2)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color(.tertiarySystemFill), in: Capsule())
+        }
+    }
+}
+
+struct ReasoningMenu: View {
+    @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var client: RemoteClient
+    @Binding var selectedModel: String
+    @Binding var selectedReasoning: String
 
     private var selectedEfforts: [CodexReasoningEffort] {
         client.modelCatalog.first(where: { $0.id == selectedModel })?.supportedReasoningEfforts ?? [
@@ -696,46 +964,21 @@ struct ModelReasoningMenu: View {
 
     var body: some View {
         Menu {
-            Menu("模型") {
-                if client.modelCatalog.isEmpty {
-                    Text("等待电脑端模型列表")
-                } else {
-                    ForEach(client.modelCatalog) { model in
-                        Button {
-                            selectedModel = model.id
-                            let effort = model.supportedReasoningEfforts?.contains(where: { $0.id == selectedReasoning }) == true
-                                ? selectedReasoning
-                                : (model.defaultReasoningEffort ?? model.supportedReasoningEfforts?.first?.id ?? selectedReasoning)
-                            selectedReasoning = effort
-                            Task { await client.updateCodexSettings(model: model.id, reasoningEffort: effort, permissionMode: nil, settings: settings) }
-                        } label: {
-                            if model.id == selectedModel {
-                                Label(model.title, systemImage: "checkmark")
-                            } else {
-                                Text(model.title)
-                            }
-                        }
-                    }
-                }
-            }
-
-            Menu("推理强度") {
-                ForEach(selectedEfforts) { effort in
-                    Button {
-                        selectedReasoning = effort.id
-                        Task { await client.updateCodexSettings(model: selectedModel, reasoningEffort: effort.id, permissionMode: nil, settings: settings) }
-                    } label: {
-                        if effort.id == selectedReasoning {
-                            Label(reasoningLabel(effort.id), systemImage: "checkmark")
-                        } else {
-                            Text(reasoningLabel(effort.id))
-                        }
+            ForEach(selectedEfforts) { effort in
+                Button {
+                    selectedReasoning = effort.id
+                    Task { await client.updateCodexSettings(model: selectedModel, reasoningEffort: effort.id, permissionMode: nil, settings: settings) }
+                } label: {
+                    if effort.id == selectedReasoning {
+                        Label(reasoningLabel(effort.id), systemImage: "checkmark")
+                    } else {
+                        Text(reasoningLabel(effort.id))
                     }
                 }
             }
         } label: {
             HStack(spacing: 3) {
-                Text("\(selectedModelTitle) \(reasoningLabel(selectedReasoning))")
+                Text(reasoningLabel(selectedReasoning))
                     .lineLimit(1)
                     .minimumScaleFactor(0.72)
                 Image(systemName: "chevron.down")
@@ -758,35 +1001,50 @@ struct PermissionMenu: View {
         Menu {
             Text("如何批准 ChatGPT 操作？")
                 .font(.caption)
-            Button {
-                set("ask")
-            } label: {
-                if permissionMode == "ask" {
-                    Label("请求批准", systemImage: "checkmark")
-                } else {
-                    Label("请求批准", systemImage: "hand.raised")
+            if isProfileAllowed(":read-only") {
+                Button {
+                    set("read")
+                } label: {
+                    if permissionMode == "read" {
+                        Label("只读", systemImage: "checkmark")
+                    } else {
+                        Label("只读", systemImage: "lock")
+                    }
                 }
             }
-            Button {
-                set("auto")
-            } label: {
-                if permissionMode == "auto" {
-                    Label("替我审批", systemImage: "checkmark")
-                } else {
-                    Label("替我审批", systemImage: "shield")
+            if isProfileAllowed(":workspace") {
+                Button {
+                    set("ask")
+                } label: {
+                    if permissionMode == "ask" {
+                        Label("请求批准", systemImage: "checkmark")
+                    } else {
+                        Label("请求批准", systemImage: "hand.raised")
+                    }
+                }
+                Button {
+                    set("auto")
+                } label: {
+                    if permissionMode == "auto" {
+                        Label("替我审批", systemImage: "checkmark")
+                    } else {
+                        Label("替我审批", systemImage: "shield")
+                    }
                 }
             }
-            Button {
-                set("full")
-            } label: {
-                if permissionMode == "full" {
-                    Label("完全访问", systemImage: "checkmark")
-                } else {
-                    Label("完全访问", systemImage: "exclamationmark.shield.fill")
+            if isProfileAllowed(":danger-full-access") {
+                Button {
+                    set("full")
+                } label: {
+                    if permissionMode == "full" {
+                        Label("完全访问", systemImage: "checkmark")
+                    } else {
+                        Label("完全访问", systemImage: "exclamationmark.shield.fill")
+                    }
                 }
             }
         } label: {
-            Image(systemName: "exclamationmark.shield.fill")
+            Image(systemName: permissionMode == "read" ? "lock" : "exclamationmark.shield.fill")
                 .foregroundStyle(permissionMode == "full" ? .orange : .primary)
         }
         .buttonStyle(.bordered)
@@ -797,69 +1055,108 @@ struct PermissionMenu: View {
         permissionMode = mode
         Task { await client.updateCodexSettings(model: nil, reasoningEffort: nil, permissionMode: mode, settings: settings) }
     }
+
+    private func isProfileAllowed(_ id: String) -> Bool {
+        guard !client.permissionProfiles.isEmpty else { return true }
+        return client.permissionProfiles.contains { $0.id == id && ($0.allowed ?? true) }
+    }
 }
 
 struct DesktopComposer: View {
     @Binding var text: String
-    @Binding var guideMode: Bool
+    let isRunning: Bool
+    let plan: CodexPlanRuntime?
     @Binding var selectedModel: String
     @Binding var selectedReasoning: String
     @Binding var permissionMode: String
     let onSend: () -> Void
+    let onStop: () -> Void
     let onImage: () -> Void
+
+    private var hasText: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         VStack(spacing: 8) {
+            if isRunning, let plan {
+                PlanStatusStrip(plan: plan)
+            }
             TextEditor(text: $text)
-                .frame(minHeight: 42, maxHeight: 76)
+                .frame(minHeight: 38, maxHeight: 68)
                 .padding(8)
                 .scrollContentBackground(.hidden)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay(alignment: .topLeading) {
                     if text.isEmpty {
-                        Text("继续输入，或添加图片 / 引导消息...")
+                        Text(isRunning ? "继续输入，会自动作为引导消息发送…" : "继续输入，或添加图片…")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 14)
                     }
                 }
-                .toolbar {
-                    ToolbarItemGroup(placement: .keyboard) {
-                        Spacer()
-                        Button {
-                            hideKeyboard()
-                        } label: {
-                            Image(systemName: "keyboard.chevron.compact.down")
-                        }
-                    }
-                }
             HStack(spacing: 8) {
                 Button(action: onImage) { Image(systemName: "plus") }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                Button { guideMode.toggle() } label: {
-                    Image(systemName: guideMode ? "shield.lefthalf.filled" : "arrow.triangle.turn.up.right.circle")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .tint(guideMode ? .orange : .blue)
                 PermissionMenu(permissionMode: $permissionMode)
                 Spacer()
-                ModelReasoningMenu(selectedModel: $selectedModel, selectedReasoning: $selectedReasoning)
+                ModelMenu(selectedModel: $selectedModel, selectedReasoning: $selectedReasoning)
+                ReasoningMenu(selectedModel: $selectedModel, selectedReasoning: $selectedReasoning)
                 Button {
                     hideKeyboard()
-                    onSend()
+                    if isRunning && !hasText {
+                        onStop()
+                    } else {
+                        onSend()
+                    }
                 } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 26))
+                    if isRunning && !hasText {
+                        ZStack {
+                            Circle()
+                                .fill(Color(.systemBackground))
+                                .frame(width: 28, height: 28)
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(.primary)
+                        }
+                    } else {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.system(size: 26))
+                    }
                 }
-                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(!isRunning && !hasText)
             }
         }
         .padding(8)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Divider() }
+    }
+}
+
+struct PlanStatusStrip: View {
+    let plan: CodexPlanRuntime
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            if let index = plan.currentIndex, let total = plan.total, total > 0 {
+                Text("第 \(index) / \(total) 步")
+                    .font(.caption.weight(.semibold))
+            }
+            if let step = plan.currentStep, !step.isEmpty {
+                Text(step)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color(.secondarySystemBackground), in: Capsule())
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 
@@ -901,7 +1198,6 @@ struct WindowsMonitorView: View {
     @EnvironmentObject private var client: RemoteClient
     @State private var selectingSlot: String?
     @State private var screenshotNote: String = "这个窗口看起来不对。请查看截图并告诉我下一步怎么处理。"
-    @State private var sendAsGuide: Bool = false
     @State private var targetSlot: String = "A"
 
     var body: some View {
@@ -930,7 +1226,7 @@ struct WindowsMonitorView: View {
                                 } onSendScreenshot: {
                                     targetSlot = slotName
                                     if let slot {
-                                        Task { await client.sendWindowScreenshotToCodex(slot: slot, note: screenshotNote, kind: sendAsGuide ? "steer" : "normal", settings: settings) }
+                                        Task { await client.sendWindowScreenshotToCodex(slot: slot, note: screenshotNote, settings: settings) }
                                     }
                                 }
                             }
@@ -973,11 +1269,10 @@ struct WindowsMonitorView: View {
 
                 WindowIssueComposer(
                     note: $screenshotNote,
-                    sendAsGuide: $sendAsGuide,
                     targetSlot: $targetSlot,
                     onSend: {
                         if let slot = client.slots.first(where: { $0.slot == targetSlot }) {
-                            Task { await client.sendWindowScreenshotToCodex(slot: slot, note: screenshotNote, kind: sendAsGuide ? "steer" : "normal", settings: settings) }
+                            Task { await client.sendWindowScreenshotToCodex(slot: slot, note: screenshotNote, settings: settings) }
                         }
                     }
                 )
@@ -1004,7 +1299,6 @@ struct WindowsMonitorView: View {
 
 struct WindowIssueComposer: View {
     @Binding var note: String
-    @Binding var sendAsGuide: Bool
     @Binding var targetSlot: String
     let onSend: () -> Void
 
@@ -1024,16 +1318,6 @@ struct WindowIssueComposer: View {
                             .padding(.vertical, 14)
                     }
                 }
-                .toolbar {
-                    ToolbarItemGroup(placement: .keyboard) {
-                        Spacer()
-                        Button {
-                            hideKeyboard()
-                        } label: {
-                            Image(systemName: "keyboard.chevron.compact.down")
-                        }
-                    }
-                }
 
             HStack(spacing: 8) {
                 Menu("窗口 \(targetSlot)") {
@@ -1042,13 +1326,6 @@ struct WindowIssueComposer: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-
-                Button { sendAsGuide.toggle() } label: {
-                    Image(systemName: sendAsGuide ? "shield.lefthalf.filled" : "arrow.triangle.turn.up.right.circle")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .tint(sendAsGuide ? .orange : .blue)
 
                 Spacer()
 

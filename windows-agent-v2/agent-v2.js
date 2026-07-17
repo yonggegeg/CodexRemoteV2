@@ -22,6 +22,7 @@ class CodexAppServer {
     this.lastError = null;
     this.notifications = [];
     this.activeTurns = new Map();
+    this.latestPlans = new Map();
   }
 
   ensureStarted() {
@@ -80,6 +81,9 @@ class CodexAppServer {
     }
     if (msg.method === 'turn/completed' || msg.method === 'turn/completedNotification' || msg.method === 'turn/completed/notification') {
       this.activeTurns.delete(threadId);
+    }
+    if (msg.method === 'turn/plan/updated' && Array.isArray(p.plan)) {
+      this.latestPlans.set(threadId, { turnId, plan: p.plan, explanation: p.explanation || null, updatedAt: new Date().toISOString() });
     }
   }
 
@@ -150,18 +154,64 @@ class CodexAppServer {
   }
 
   simplifyThreadItems(items) {
-    return (items || []).slice(-80).map((item, index) => {
+    const output = [];
+    let pendingProcess = null;
+
+    const flushProcess = (keepReasoningOnly = false) => {
+      if (!pendingProcess) return;
+      const parts = [];
+      if (pendingProcess.commandCount > 0) parts.push(`运行了 ${pendingProcess.commandCount} 个命令`);
+      if (!parts.length && keepReasoningOnly && pendingProcess.latestText) parts.push(pendingProcess.latestText);
+      if (parts.length) {
+        output.push({
+          id: `process-${pendingProcess.turnId || 'unknown'}-${pendingProcess.startIndex}`,
+          role: 'status',
+          text: parts.join('，'),
+          createdAt: null,
+          type: 'status',
+          turnId: pendingProcess.turnId || null,
+          images: []
+        });
+      }
+      pendingProcess = null;
+    };
+
+    const addProcess = (item, raw, index) => {
+      const turnId = item.turnId || raw.turnId || null;
+      if (!pendingProcess) {
+        pendingProcess = { turnId, startIndex: index, commandCount: 0, fileCount: 0, latestText: '' };
+      }
+      const rawType = String(raw.type || '').toLowerCase();
+      if (raw.type === 'fileChange') pendingProcess.fileCount += Math.max(1, (raw.changes || []).length);
+      else if (rawType.includes('command')) pendingProcess.commandCount += 1;
+      else if (raw.type === 'reasoning') {
+        if (Array.isArray(raw.summary) && raw.summary.length) pendingProcess.latestText = cleanStatusText(raw.summary.join(' '));
+        else pendingProcess.latestText = '正在处理';
+      }
+    };
+
+    for (const [index, item] of (items || []).slice(-140).entries()) {
       const raw = item.item || item;
       const role = raw.role || raw.type || item.type || 'item';
       const images = [];
       let text = '';
+      const rawType = raw.type || item.type || null;
+      const rawTypeLower = String(rawType || '').toLowerCase();
 
-      if (raw.type === 'fileChange') {
-        text = summarizeFileChange(raw);
-      } else if (typeof raw.text === 'string') {
-        text = raw.text;
+      if (rawType === 'fileChange') {
+        flushProcess(false);
+        output.push(fileChangeSummaryItem(item, raw, index));
+        continue;
       }
 
+      if (rawType === 'reasoning' || rawTypeLower.includes('command')) {
+        addProcess(item, raw, index);
+        continue;
+      }
+
+      flushProcess(false);
+
+      if (typeof raw.text === 'string') text = raw.text;
       if (!text && typeof raw.message === 'string') text = raw.message;
 
       if (!text && Array.isArray(raw.content)) {
@@ -183,18 +233,61 @@ class CodexAppServer {
 
       if (!text && Array.isArray(raw.summary)) text = raw.summary.join('\n');
       if (!text && raw.name) text = raw.name;
-      if (!text && raw.type === 'reasoning') text = '正在思考 / 处理中';
       if (!text) text = '';
 
-      return {
-        id: raw.id || item.id || `${Date.now()}-${index}`,
+      const simplified = {
+        id: raw.id || item.id || `${item.turnId || raw.turnId || 'item'}-${index}`,
         role,
         text,
         createdAt: raw.createdAt || item.createdAt || null,
         type: raw.type || item.type || null,
+        turnId: item.turnId || raw.turnId || null,
         images
       };
-    }).filter(x => x.text || (x.images && x.images.length));
+      if (simplified.text || (simplified.images && simplified.images.length)) output.push(simplified);
+    }
+
+    flushProcess(true);
+    return output.slice(-90);
+  }
+
+  analyzeThreadRuntime(threadId, items) {
+    const rawItems = (items || []).map(item => item.item || item).filter(Boolean);
+    const last = rawItems[rawItems.length - 1];
+    const lastWithTurn = [...(items || [])].reverse().find(item => item.turnId || item.item?.turnId);
+    const activeTurnId = lastWithTurn?.turnId || lastWithTurn?.item?.turnId || null;
+    const lastType = String(last?.type || '').toLowerCase();
+    const activeTypes = new Set(['reasoning', 'filechange', 'commandexecution', 'commandexecutionoutput', 'usermessage']);
+    const finishedTypes = new Set(['agentmessage']);
+    const active = !!activeTurnId && activeTypes.has(lastType) && !finishedTypes.has(lastType);
+    if (active && activeTurnId) this.activeTurns.set(threadId, activeTurnId);
+    const planState = this.planRuntime(threadId, activeTurnId);
+    return {
+      active,
+      activeTurnId: active ? activeTurnId : null,
+      threadId,
+      lastItemType: last?.type || null,
+      plan: planState
+    };
+  }
+
+  planRuntime(threadId, activeTurnId) {
+    const planEntry = this.latestPlans.get(threadId);
+    if (!planEntry || (activeTurnId && planEntry.turnId !== activeTurnId)) return null;
+    const plan = Array.isArray(planEntry.plan) ? planEntry.plan : [];
+    if (!plan.length) return null;
+    const currentIndex = Math.max(0, plan.findIndex(step => step.status === 'inProgress'));
+    const completed = plan.filter(step => step.status === 'completed').length;
+    const displayIndex = currentIndex >= 0 ? currentIndex + 1 : Math.min(completed + 1, plan.length);
+    const current = plan[currentIndex >= 0 ? currentIndex : Math.min(completed, plan.length - 1)];
+    return {
+      currentStep: current?.step || null,
+      currentIndex: displayIndex,
+      total: plan.length,
+      completed,
+      explanation: planEntry.explanation || null,
+      updatedAt: planEntry.updatedAt
+    };
   }
 
   async listModels() {
@@ -214,6 +307,16 @@ class CodexAppServer {
     }));
   }
 
+  async listPermissionProfiles() {
+    await this.initialize();
+    const result = await this.request('permissionProfile/list', {});
+    return (result.data || []).map(profile => ({
+      id: profile.id,
+      description: profile.description || null,
+      allowed: profile.allowed !== false
+    })).filter(profile => profile.id);
+  }
+
   async readConfig() {
     await this.initialize();
     const result = await this.request('config/read', {});
@@ -221,27 +324,67 @@ class CodexAppServer {
     return {
       model: c.model || null,
       reasoningEffort: c.model_reasoning_effort || null,
-      permissionMode: 'ask'
+      permissionMode: this.permissionModeFromConfig(c)
     };
   }
 
-  mapPermission(permissionMode) {
-    if (permissionMode === 'full') return { approvalPolicy: 'never', permissions: ':danger-full-access' };
-    if (permissionMode === 'auto') return { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', permissions: null };
-    return { approvalPolicy: 'on-request', approvalsReviewer: 'user', permissions: null };
+  permissionModeFromConfig(config) {
+    const permissions = config.permissions || config.default_permissions || null;
+    const sandbox = config.sandbox_mode || null;
+    const approvalPolicy = config.approval_policy || null;
+    const reviewer = config.approvals_reviewer || null;
+    if (permissions === ':danger-full-access' || sandbox === 'danger-full-access' || approvalPolicy === 'never') return 'full';
+    if (reviewer === 'auto_review' || reviewer === 'guardian_subagent') return 'auto';
+    if (permissions === ':read-only' || sandbox === 'read-only') return 'read';
+    return 'ask';
   }
 
-  async updateThreadSettings(threadId, settings) {
-    await this.initialize();
-    if (!threadId) return null;
+  mapPermission(permissionMode) {
+    if (permissionMode === 'full') {
+      return { approvalPolicy: 'never', approvalsReviewer: 'user', permissions: ':danger-full-access' };
+    }
+    if (permissionMode === 'auto') {
+      return { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', permissions: ':workspace' };
+    }
+    if (permissionMode === 'read') {
+      return { approvalPolicy: 'on-request', approvalsReviewer: 'user', permissions: ':read-only' };
+    }
+    return { approvalPolicy: 'on-request', approvalsReviewer: 'user', permissions: ':workspace' };
+  }
+
+  settingsPayload(settings = {}) {
     const permission = this.mapPermission(settings.permissionMode || 'ask');
-    return await this.request('thread/settings/update', {
-      threadId,
+    return {
       model: settings.model || null,
       effort: settings.reasoningEffort || null,
       approvalPolicy: permission.approvalPolicy,
       approvalsReviewer: permission.approvalsReviewer || null,
       permissions: permission.permissions || null
+    };
+  }
+
+  async ensureThreadLoaded(threadId, settings = {}) {
+    await this.initialize();
+    if (!threadId) return null;
+    const payload = this.settingsPayload(settings);
+    return await this.request('thread/resume', {
+      threadId,
+      excludeTurns: true,
+      model: payload.model,
+      approvalPolicy: payload.approvalPolicy,
+      approvalsReviewer: payload.approvalsReviewer,
+      permissions: payload.permissions
+    }, 60000);
+  }
+
+  async updateThreadSettings(threadId, settings) {
+    await this.initialize();
+    if (!threadId) return null;
+    await this.ensureThreadLoaded(threadId, settings);
+    const payload = this.settingsPayload(settings);
+    return await this.request('thread/settings/update', {
+      threadId,
+      ...payload
     }, 30000);
   }
 
@@ -253,23 +396,41 @@ class CodexAppServer {
     const text = (message.text || '').trim();
     if (text) input.push({ type: 'text', text });
     for (const p of attachmentPaths) {
-      input.push({ type: 'image', path: p, detail: 'high' });
+      input.push({ type: 'localImage', path: p, detail: 'high' });
     }
     if (!input.length) throw new Error('消息内容为空');
 
     if (message.kind === 'steer') {
-      const expectedTurnId = this.activeTurns.get(threadId);
+      await this.ensureThreadLoaded(threadId, settings);
+      const expectedTurnId = message.turnId || this.activeTurns.get(threadId);
       if (expectedTurnId) {
-        return await this.request('turn/steer', { threadId, expectedTurnId, input }, 30000);
+        try {
+          return await this.request('turn/steer', { threadId, expectedTurnId, input, clientUserMessageId: message.id || null }, 30000);
+        } catch (err) {
+          console.error(`[codex] steer failed, fallback to new turn: ${err.message}`);
+        }
       }
-      return await this.request('turn/start', { threadId, input, model: settings.model || null, effort: settings.reasoningEffort || null, approvalPolicy: this.mapPermission(settings.permissionMode || 'ask').approvalPolicy, permissions: this.mapPermission(settings.permissionMode || 'ask').permissions || null }, 30000);
     }
-    return await this.request('turn/start', { threadId, input, model: settings.model || null, effort: settings.reasoningEffort || null, approvalPolicy: this.mapPermission(settings.permissionMode || 'ask').approvalPolicy, permissions: this.mapPermission(settings.permissionMode || 'ask').permissions || null }, 30000);
+
+    await this.ensureThreadLoaded(threadId, settings);
+    const turnSettings = this.settingsPayload(settings);
+    if (message.kind === 'steer') {
+      return await this.request('turn/start', { threadId, input, ...turnSettings, clientUserMessageId: message.id || null }, 30000);
+    }
+    return await this.request('turn/start', { threadId, input, ...turnSettings, clientUserMessageId: message.id || null }, 30000);
+  }
+
+  async interruptTurn(threadId, turnId) {
+    await this.initialize();
+    const activeTurnId = turnId || this.activeTurns.get(threadId);
+    if (!threadId || !activeTurnId) throw new Error('没有可停止的运行中对话');
+    return await this.request('turn/interrupt', { threadId, turnId: activeTurnId }, 30000);
   }
 }
 
 const codex = new CodexAppServer();
 let latestCodexSettings = { model: null, reasoningEffort: null, permissionMode: 'ask' };
+let lastAppliedSettingsKey = null;
 
 function mergeDefinedSettings(base, incoming) {
   const next = { ...base };
@@ -320,6 +481,58 @@ function cleanUserText(text) {
   return text.replace(/# Files mentioned by the user:[\s\S]*?(?=## My request for Codex:|$)/, '').trim();
 }
 
+function cleanStatusText(text) {
+  return String(text || '')
+    .replace(/\*\*/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function diffStats(diff) {
+  const stats = { additions: 0, deletions: 0 };
+  for (const line of String(diff || '').split(/\r?\n/)) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) stats.additions += 1;
+    else if (line.startsWith('-')) stats.deletions += 1;
+  }
+  return stats;
+}
+
+function fileChangeSummaryItem(item, raw, index) {
+  const changes = Array.isArray(raw.changes) ? raw.changes : [];
+  let additions = 0;
+  let deletions = 0;
+  const files = changes.slice(0, 4).map(change => {
+    const stats = diffStats(change.diff || '');
+    additions += stats.additions;
+    deletions += stats.deletions;
+    const file = path.basename(change.path || 'unknown');
+    const kind = change.kind?.type || change.kind || 'update';
+    return { path: change.path || null, file, kind, additions: stats.additions, deletions: stats.deletions };
+  });
+  for (const change of changes.slice(4)) {
+    const stats = diffStats(change.diff || '');
+    additions += stats.additions;
+    deletions += stats.deletions;
+  }
+  const count = Math.max(1, changes.length);
+  const text = `${count} 个文件已更改  +${additions} -${deletions}`;
+  return {
+    id: raw.id || item.id || `file-${item.turnId || raw.turnId || 'item'}-${index}`,
+    role: 'status',
+    text,
+    createdAt: raw.createdAt || item.createdAt || null,
+    type: 'fileChange',
+    turnId: item.turnId || raw.turnId || null,
+    images: [],
+    fileCount: count,
+    additions,
+    deletions,
+    files
+  };
+}
+
 function summarizeFileChange(raw) {
   const changes = Array.isArray(raw.changes) ? raw.changes : [];
   const lines = changes.slice(0, 8).map(change => {
@@ -347,6 +560,19 @@ async function api(path, options = {}) {
   try { data = text ? JSON.parse(text) : {}; } catch { data = { ok: false, error: text }; }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
+}
+
+async function reportMessageStatus(statuses) {
+  const list = Array.isArray(statuses) ? statuses : [statuses];
+  if (!list.length) return;
+  try {
+    await api('/agent/messages/status', {
+      method: 'POST',
+      body: JSON.stringify({ statuses: list.map(item => ({ ...item, processedAt: new Date().toISOString() })) })
+    });
+  } catch (err) {
+    console.error(`[relay] failed to report message status: ${err.message}`);
+  }
 }
 
 function runPowerShell(args, timeoutMs = 20000) {
@@ -389,6 +615,11 @@ async function fetchPendingMessages() {
   return data.messages || [];
 }
 
+async function fetchPendingCommands() {
+  const data = await api('/agent/commands/next');
+  return data.commands || [];
+}
+
 function saveInboundMessages(messages) {
   const saved = [];
   if (!messages.length) return;
@@ -414,12 +645,30 @@ function saveInboundMessages(messages) {
 
 async function handleInboundMessages(messages) {
   const saved = saveInboundMessages(messages) || [];
+  let changed = false;
   for (const item of saved) {
     try {
       await codex.sendMessage(item.message, item.attachmentPaths, latestCodexSettings);
+      changed = true;
       console.log(`[codex] sent ${item.message.id} to thread ${item.message.threadId || '(selected)'}`);
+      await reportMessageStatus({ id: item.message.id, status: 'sentToCodex', threadId: item.message.threadId || null, kind: item.message.kind || null, error: null });
     } catch (err) {
       console.error(`[codex] failed to send ${item.message.id}: ${err.message}`);
+      await reportMessageStatus({ id: item.message.id, status: 'error', threadId: item.message.threadId || null, kind: item.message.kind || null, error: err.message });
+    }
+  }
+  return changed;
+}
+
+async function handleInboundCommands(commands) {
+  for (const command of commands || []) {
+    try {
+      if (command.type === 'interrupt') {
+        await codex.interruptTurn(command.threadId, command.turnId);
+        console.log(`[codex] interrupted turn ${command.turnId || '(active)'} in thread ${command.threadId}`);
+      }
+    } catch (err) {
+      console.error(`[codex] command ${command.id || command.type} failed: ${err.message}`);
     }
   }
 }
@@ -446,6 +695,7 @@ async function main() {
   let lastCodex = 0;
   let codexStatus = 'Codex 未连接';
   let modelCatalog = [];
+  let permissionProfiles = [];
   let codexConfig = {};
 
   while (true) {
@@ -460,6 +710,7 @@ async function main() {
         try {
           threads = await codex.listThreads(20);
           modelCatalog = await codex.listModels();
+          permissionProfiles = await codex.listPermissionProfiles();
           codexConfig = await codex.readConfig();
           latestCodexSettings = mergeDefinedSettings(latestCodexSettings, codexConfig);
           codexStatus = `Codex 已连接，发现 ${threads.length} 个任务`;
@@ -472,12 +723,35 @@ async function main() {
       const control = await api('/agent/control');
       if (control.codexSettings) {
         latestCodexSettings = mergeDefinedSettings(latestCodexSettings, control.codexSettings);
-        try { await codex.updateThreadSettings(control.selectedThreadId, latestCodexSettings); } catch (err) { console.error(`[codex] settings update failed: ${err.message}`); }
+        const settingsKey = [
+          control.selectedThreadId || '',
+          latestCodexSettings.model || '',
+          latestCodexSettings.reasoningEffort || '',
+          latestCodexSettings.permissionMode || ''
+        ].join('|');
+        if (settingsKey !== lastAppliedSettingsKey) {
+          try {
+            await codex.updateThreadSettings(control.selectedThreadId, latestCodexSettings);
+            lastAppliedSettingsKey = settingsKey;
+          } catch (err) {
+            console.error(`[codex] settings update failed: ${err.message}`);
+          }
+        }
       }
+      const commands = await fetchPendingCommands();
+      await handleInboundCommands(commands);
+      const messages = await fetchPendingMessages();
+      const handledMessages = await handleInboundMessages(messages);
+      if (handledMessages) {
+        lastCodex = 0;
+      }
+
       let threadItems = [];
+      let codexRuntime = { active: false, activeTurnId: null, threadId: control.selectedThreadId || null };
       if (control.selectedThreadId) {
         try {
           const rawItems = await codex.listThreadItems(control.selectedThreadId, 80);
+          codexRuntime = codex.analyzeThreadRuntime(control.selectedThreadId, rawItems);
           threadItems = codex.simplifyThreadItems(rawItems);
         } catch (err) {
           console.error(`[codex] thread items failed: ${err.message}`);
@@ -501,9 +775,6 @@ async function main() {
         }
       }
 
-      const messages = await fetchPendingMessages();
-      await handleInboundMessages(messages);
-
       await heartbeat({
         statusText: `${slots.length ? `正在监看 ${slots.length} 个窗口` : '在线，等待选择窗口'}；${codexStatus}`,
         windows,
@@ -511,7 +782,9 @@ async function main() {
         threads,
         threadItems,
         modelCatalog,
-        codexSettings: latestCodexSettings
+        permissionProfiles,
+        codexSettings: latestCodexSettings,
+        codexRuntime
       });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] ${err.message}`);
@@ -525,6 +798,3 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
-
-
-

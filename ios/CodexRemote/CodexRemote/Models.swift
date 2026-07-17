@@ -23,7 +23,11 @@ struct RelayState: Decodable {
     let threads: [RemoteThread]
     let threadItems: [RemoteThreadItem]?
     let modelCatalog: [CodexModel]?
+    let permissionProfiles: [CodexPermissionProfile]?
     let codexSettings: CodexSettings?
+    let codexRuntime: CodexRuntime?
+    let latestMessageStatus: RelayMessageStatus?
+    let messageStatuses: [RelayMessageStatus]?
     let selectedThreadId: String?
     let time: String?
 }
@@ -89,7 +93,12 @@ struct RemoteThreadItem: Identifiable, Decodable {
     let text: String
     let createdAt: String?
     let type: String?
+    let turnId: String?
     let images: [RemoteThreadImage]?
+    let fileCount: Int?
+    let additions: Int?
+    let deletions: Int?
+    let files: [RemoteFileChange]?
 
     var isUser: Bool {
         let r = (role ?? "").lowercased()
@@ -104,6 +113,16 @@ struct RemoteThreadItem: Identifiable, Decodable {
     var isFileChange: Bool {
         (type ?? "").lowercased() == "filechange"
     }
+}
+
+struct RemoteFileChange: Identifiable, Decodable, Hashable {
+    let path: String?
+    let file: String?
+    let kind: String?
+    let additions: Int?
+    let deletions: Int?
+
+    var id: String { path ?? file ?? "change" }
 }
 
 struct RemoteThreadImage: Identifiable, Decodable {
@@ -138,6 +157,12 @@ struct CodexReasoningEffort: Identifiable, Decodable, Hashable {
     let description: String?
 }
 
+struct CodexPermissionProfile: Identifiable, Decodable, Hashable {
+    let id: String
+    let description: String?
+    let allowed: Bool?
+}
+
 struct CodexSettings: Codable, Hashable {
     let model: String?
     let reasoningEffort: String?
@@ -149,6 +174,52 @@ struct CodexSettingsRequest: Encodable {
     let model: String?
     let reasoningEffort: String?
     let permissionMode: String?
+}
+
+struct RelayMessageStatus: Decodable, Hashable {
+    let id: String
+    let status: String?
+    let text: String?
+    let threadId: String?
+    let kind: String?
+    let error: String?
+    let processedAt: String?
+    let updatedAt: String?
+
+    var displayText: String {
+        switch status {
+        case "queued": return "已提交，等待电脑处理…"
+        case "deliveredToAgent": return "Windows Agent 已收到，正在发给 Codex…"
+        case "sentToCodex": return "已发送到电脑 Codex"
+        case "error": return error ?? "发送失败"
+        default: return status ?? "等待处理"
+        }
+    }
+
+    var isError: Bool { status == "error" }
+}
+
+struct CodexRuntime: Codable, Hashable {
+    let active: Bool?
+    let activeTurnId: String?
+    let threadId: String?
+    let lastItemType: String?
+    let plan: CodexPlanRuntime?
+    let updatedAt: String?
+}
+
+struct CodexPlanRuntime: Codable, Hashable {
+    let currentStep: String?
+    let currentIndex: Int?
+    let total: Int?
+    let completed: Int?
+    let explanation: String?
+    let updatedAt: String?
+}
+
+struct InterruptCodexRequest: Encodable {
+    let threadId: String?
+    let turnId: String?
 }
 
 struct CodexSettingsEnvelope: Decodable {
@@ -210,6 +281,7 @@ struct SendMessageRequest: Encodable {
     let threadId: String?
     let text: String
     let kind: String
+    let turnId: String?
     let attachments: [MessageAttachment]
 }
 

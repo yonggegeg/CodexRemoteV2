@@ -29,14 +29,23 @@ let state = {
   threadItems: [],
   selectedThreadId: null,
   modelCatalog: [],
+  permissionProfiles: [],
   codexSettings: {
     model: null,
     reasoningEffort: null,
     permissionMode: "ask"
   },
+  codexRuntime: {
+    active: false,
+    activeTurnId: null,
+    threadId: null,
+    updatedAt: null
+  },
   events: [],
   uploads: [],
-  pendingMessages: []
+  pendingMessages: [],
+  pendingCommands: [],
+  messageStatuses: []
 };
 
 function load() {
@@ -101,7 +110,11 @@ function compactState() {
     threadItems: state.threadItems || [],
     selectedThreadId: state.selectedThreadId,
     modelCatalog: state.modelCatalog || [],
+    permissionProfiles: state.permissionProfiles || [],
     codexSettings: state.codexSettings || {},
+    codexRuntime: state.codexRuntime || {},
+    latestMessageStatus: (state.messageStatuses || [])[state.messageStatuses.length - 1] || null,
+    messageStatuses: (state.messageStatuses || []).slice(-20),
     time: now()
   };
 }
@@ -111,6 +124,15 @@ function makeId(prefix) { return prefix + '_' + Date.now() + '_' + Math.random()
 function pushEvent(type, payload) {
   state.events.push({ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, type, payload, createdAt: now() });
   if (state.events.length > 300) state.events = state.events.slice(-300);
+}
+
+function setMessageStatus(id, patch) {
+  if (!id) return;
+  if (!Array.isArray(state.messageStatuses)) state.messageStatuses = [];
+  const existing = state.messageStatuses.find(m => m.id === id);
+  if (existing) Object.assign(existing, patch, { updatedAt: now() });
+  else state.messageStatuses.push({ id, ...patch, updatedAt: now() });
+  if (state.messageStatuses.length > 80) state.messageStatuses = state.messageStatuses.slice(-80);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -164,14 +186,31 @@ const server = http.createServer(async (req, res) => {
           threadId: body.threadId || state.selectedThreadId || null,
           text: body.text || '',
           kind: body.kind || 'normal',
+          turnId: body.turnId || state.codexRuntime?.activeTurnId || null,
           attachments: (body.attachments || []).map(a => ({ id: a.id, fileName: a.fileName || null, mimeType: a.mimeType || null })),
           createdAt: now(),
           source: 'ios'
         };
         state.pendingMessages.push(message);
+        setMessageStatus(message.id, { status: 'queued', text: message.text, threadId: message.threadId, kind: message.kind, error: null });
         pushEvent('messageQueued', { id: message.id, threadId: message.threadId });
         save();
         return send(res, 200, { ok: true, message });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/codex/interrupt') {
+        const body = await readBody(req);
+        const command = {
+          id: makeId('cmd'),
+          type: 'interrupt',
+          threadId: body.threadId || state.selectedThreadId || state.codexRuntime?.threadId || null,
+          turnId: body.turnId || state.codexRuntime?.activeTurnId || null,
+          createdAt: now()
+        };
+        state.pendingCommands.push(command);
+        pushEvent('commandQueued', command);
+        save();
+        return send(res, 200, { ok: true, command });
       }
 
       if (req.method === 'POST' && url.pathname === '/api/windows/select') {
@@ -218,7 +257,9 @@ const server = http.createServer(async (req, res) => {
 
       
       if (req.method === 'GET' && url.pathname === '/agent/messages/next') {
-        const messages = state.pendingMessages.splice(0, 10).map(m => ({
+        const rawMessages = state.pendingMessages.splice(0, 10);
+        for (const m of rawMessages) setMessageStatus(m.id, { status: 'deliveredToAgent', threadId: m.threadId, kind: m.kind, error: null });
+        const messages = rawMessages.map(m => ({
           ...m,
           attachments: (m.attachments || []).map(a => {
             const upload = state.uploads.find(u => u.id === a.id);
@@ -227,6 +268,28 @@ const server = http.createServer(async (req, res) => {
         }));
         if (messages.length) save();
         return send(res, 200, { ok: true, messages });
+      }
+      if (req.method === 'GET' && url.pathname === '/agent/commands/next') {
+        const commands = state.pendingCommands.splice(0, 10);
+        if (commands.length) save();
+        return send(res, 200, { ok: true, commands });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/agent/messages/status') {
+        const body = await readBody(req);
+        const updates = Array.isArray(body.statuses) ? body.statuses : (body.id ? [body] : []);
+        for (const item of updates) {
+          setMessageStatus(item.id, {
+            status: item.status || 'unknown',
+            threadId: item.threadId || null,
+            kind: item.kind || null,
+            error: item.error || null,
+            processedAt: item.processedAt || now()
+          });
+          pushEvent('messageStatusChanged', { id: item.id, status: item.status || 'unknown', error: item.error || null });
+        }
+        save();
+        return send(res, 200, { ok: true });
       }
       if (req.method === 'POST' && url.pathname === '/agent/heartbeat') {
         const body = await readBody(req);
@@ -250,7 +313,9 @@ const server = http.createServer(async (req, res) => {
         }
         if (Array.isArray(body.threadItems)) state.threadItems = body.threadItems;
         if (Array.isArray(body.modelCatalog)) state.modelCatalog = body.modelCatalog;
+        if (Array.isArray(body.permissionProfiles)) state.permissionProfiles = body.permissionProfiles;
         if (body.codexSettings) state.codexSettings = { ...state.codexSettings, ...body.codexSettings };
+        if (body.codexRuntime) state.codexRuntime = { ...state.codexRuntime, ...body.codexRuntime, updatedAt: now() };
         if (Array.isArray(body.slots)) {
           for (const incoming of body.slots) {
             const slot = state.slots.find(s => s.slot === incoming.slot);
@@ -281,6 +346,4 @@ process.on('SIGTERM', () => { save(); process.exit(0); });
 server.listen(PORT, HOST, () => {
   console.log(`Codex Remote Relay v2 listening on http://${HOST}:${PORT}`);
 });
-
-
 
