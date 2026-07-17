@@ -1,6 +1,7 @@
 ﻿param(
   [string]$Mode = "list",
   [string]$Hwnd = "",
+  [string]$TextFile = "",
   [int]$Quality = 55,
   [int]$MaxWidth = 900
 )
@@ -22,6 +23,10 @@ public class WinApi {
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
 
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
@@ -128,11 +133,53 @@ function Capture-Window([string]$HwndText) {
   }
 }
 
+function Send-TextToWindow([string]$HwndText, [string]$TextFilePath) {
+  if ([string]::IsNullOrWhiteSpace($HwndText)) { throw "hwnd is required" }
+  if ([string]::IsNullOrWhiteSpace($TextFilePath) -or -not (Test-Path -LiteralPath $TextFilePath)) { throw "text file is required" }
+  $text = [System.IO.File]::ReadAllText($TextFilePath, [System.Text.Encoding]::UTF8)
+  if ([string]::IsNullOrWhiteSpace($text)) { throw "text is empty" }
+
+  $ptr = [IntPtr]::new([Int64]$HwndText)
+  $rect = New-Object WinApi+RECT
+  if (-not [WinApi]::GetWindowRect($ptr, [ref]$rect)) { throw "GetWindowRect failed" }
+  $w = $rect.Right - $rect.Left
+  $h = $rect.Bottom - $rect.Top
+  if ($w -lt 200 -or $h -lt 200) { throw "invalid window size" }
+
+  [void][WinApi]::ShowWindow($ptr, 9)
+  [void][WinApi]::SetForegroundWindow($ptr)
+  Start-Sleep -Milliseconds 350
+
+  $x = [int]($rect.Left + ($w / 2))
+  $y = [int]($rect.Bottom - 72)
+  [void][WinApi]::SetCursorPos($x, $y)
+  [WinApi]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 40
+  [WinApi]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 120
+
+  Set-Clipboard -Value $text
+  Start-Sleep -Milliseconds 120
+  $wshell = New-Object -ComObject WScript.Shell
+  [void]$wshell.SendKeys("^v")
+  Start-Sleep -Milliseconds 200
+  [void]$wshell.SendKeys("{ENTER}")
+
+  [pscustomobject]@{
+    ok = $true
+    hwnd = $HwndText
+    pastedChars = $text.Length
+    sentAt = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
 try {
   if ($Mode -eq "list") {
     Get-WindowsList | ConvertTo-Json -Depth 5 -Compress
   } elseif ($Mode -eq "capture") {
     Capture-Window $Hwnd | ConvertTo-Json -Depth 5 -Compress
+  } elseif ($Mode -eq "sendText") {
+    Send-TextToWindow $Hwnd $TextFile | ConvertTo-Json -Depth 5 -Compress
   } else {
     throw "unknown mode: $Mode"
   }

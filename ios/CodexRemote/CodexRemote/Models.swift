@@ -201,7 +201,9 @@ struct RelayMessageStatus: Decodable, Hashable {
         switch status {
         case "queued": return "已提交，等待电脑处理…"
         case "deliveredToAgent": return "Windows Agent 已收到，正在发给 Codex…"
-        case "sentToCodex": return "已发送到电脑 Codex"
+        case "submittedToCodexRuntime": return "已写入后台 Codex，电脑窗口待同步"
+        case "visibleInDesktop": return "电脑窗口已同步"
+        case "sentToCodex": return "已写入后台 Codex，电脑窗口待同步"
         case "error": return error ?? "发送失败"
         default: return status ?? "等待处理"
         }

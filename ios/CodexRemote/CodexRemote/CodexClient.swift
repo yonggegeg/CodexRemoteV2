@@ -399,7 +399,7 @@ final class RemoteClient: ObservableObject {
 
     private func shouldShowMessageStatus(_ status: RelayMessageStatus) -> Bool {
         if status.isError { return true }
-        guard status.status == "sentToCodex" else { return true }
+        guard status.status == "sentToCodex" || status.status == "submittedToCodexRuntime" || status.status == "visibleInDesktop" else { return true }
         let raw = status.updatedAt ?? status.processedAt
         guard let raw, let date = ISO8601DateFormatter().date(from: raw) else { return true }
         return Date().timeIntervalSince(date) < 12

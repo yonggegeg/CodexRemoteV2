@@ -670,6 +670,29 @@ async function capture(hwnd) {
   return await runPowerShell(['-Mode', 'capture', '-Hwnd', String(hwnd), '-Quality', '55', '-MaxWidth', '900'], 20000);
 }
 
+function findDesktopCodexWindow(windows) {
+  const candidates = (windows || []).filter(w => {
+    const title = String(w.title || '').toLowerCase();
+    const process = String(w.process || '').toLowerCase();
+    return process === 'chatgpt' || process.includes('codex') || title.includes('codex') || title === 'chatgpt';
+  });
+  return candidates.find(w => w.foreground) || candidates[0] || null;
+}
+
+async function sendTextToDesktopWindow(window, text) {
+  if (!window?.hwnd) throw new Error('没有找到 ChatGPT/Codex 桌面窗口');
+  const cleanText = String(text || '').trim();
+  if (!cleanText) throw new Error('消息内容为空');
+  const dir = path.join(__dirname, 'desktop-send');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `message-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+  fs.writeFileSync(file, cleanText, 'utf8');
+  try {
+    return await runPowerShell(['-Mode', 'sendText', '-Hwnd', String(window.hwnd), '-TextFile', file], 15000);
+  } finally {
+    try { fs.unlinkSync(file); } catch {}
+  }
+}
 
 async function fetchPendingMessages() {
   const data = await api('/agent/messages/next');
@@ -716,15 +739,23 @@ function saveInboundMessages(messages) {
   return saved;
 }
 
-async function handleInboundMessages(messages) {
+async function handleInboundMessages(messages, windows) {
   const saved = saveInboundMessages(messages) || [];
   let changed = false;
   for (const item of saved) {
     try {
-      await codex.sendMessage(item.message, item.attachmentPaths, latestCodexSettings);
-      changed = true;
-      console.log(`[codex] sent ${item.message.id} to thread ${item.message.threadId || '(selected)'}`);
-      await reportMessageStatus({ id: item.message.id, status: 'sentToCodex', threadId: item.message.threadId || null, kind: item.message.kind || null, error: null });
+      const desktopWindow = findDesktopCodexWindow(windows);
+      if (desktopWindow && item.attachmentPaths.length === 0 && String(item.message.text || '').trim()) {
+        await sendTextToDesktopWindow(desktopWindow, item.message.text);
+        changed = true;
+        console.log(`[desktop] sent ${item.message.id} to ${desktopWindow.title} (${desktopWindow.hwnd})`);
+        await reportMessageStatus({ id: item.message.id, status: 'visibleInDesktop', threadId: item.message.threadId || null, kind: item.message.kind || null, error: null });
+      } else {
+        await codex.sendMessage(item.message, item.attachmentPaths, latestCodexSettings);
+        changed = true;
+        console.log(`[codex] sent ${item.message.id} to thread ${item.message.threadId || '(selected)'}`);
+        await reportMessageStatus({ id: item.message.id, status: 'submittedToCodexRuntime', threadId: item.message.threadId || null, kind: item.message.kind || null, error: null });
+      }
     } catch (err) {
       console.error(`[codex] failed to send ${item.message.id}: ${err.message}`);
       await reportMessageStatus({ id: item.message.id, status: 'error', threadId: item.message.threadId || null, kind: item.message.kind || null, error: err.message });
@@ -846,7 +877,7 @@ async function main() {
       const historyRequests = await fetchPendingHistoryRequests();
       await handleHistoryRequests(historyRequests);
       const messages = await fetchPendingMessages();
-      const handledMessages = await handleInboundMessages(messages);
+      const handledMessages = await handleInboundMessages(messages, windows);
       if (handledMessages) {
         lastCodex = 0;
       }
