@@ -5,6 +5,27 @@ private func hideKeyboard() {
     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
 }
 
+private func reasoningLabel(_ effort: String?) -> String {
+    switch (effort ?? "").lowercased() {
+    case "low": return "低"
+    case "medium": return "中"
+    case "high": return "高"
+    case "xhigh": return "极高"
+    case "max": return "最大"
+    case "ultra": return "Ultra"
+    default: return effort ?? "高"
+    }
+}
+
+private func permissionLabel(_ mode: String?) -> String {
+    switch mode {
+    case "ask": return "请求批准"
+    case "auto": return "替我审批"
+    case "full": return "完全访问"
+    default: return "请求批准"
+    }
+}
+
 
 struct RootView: View {
     @EnvironmentObject private var settings: AppSettings
@@ -63,8 +84,11 @@ struct ThreadsView: View {
     @EnvironmentObject private var client: RemoteClient
     @State private var inputText: String = ""
     @State private var guideMode: Bool = false
-    @State private var selectedModel: String = "GPT-5.5 高"
+    @State private var selectedModel: String = "gpt-5.5"
+    @State private var selectedReasoning: String = "high"
+    @State private var permissionMode: String = "full"
     @State private var showActionDrawer: Bool = false
+    @State private var showTaskSwitcher: Bool = false
 
     private let sampleMessages: [(String, String, Bool)] = [
         ("user", "我需要手机 App 能同步电脑 Codex 当前对话，并且可以随时发送引导消息纠正操作。", false),
@@ -80,31 +104,15 @@ struct ThreadsView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
                             HeaderCard()
-                            if !client.threads.isEmpty {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    Text("电脑 Codex 任务")
-                                        .font(.headline)
-                                    ForEach(client.threads) { thread in
-                                        Button {
-                                            Task { await client.selectThread(thread, settings: settings) }
-                                        } label: {
-                                            ThreadRow(thread: thread, selected: thread.id == client.selectedThreadId)
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .padding(14)
-                                .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-                            }
                             workspaceHeader
                             if client.threadItems.isEmpty {
                                 ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
-                                    ChatMessageCard(role: message.0, text: message.1, compact: message.2)
+                                    ChatMessageCard(role: message.0, text: message.1, compact: message.2, assistantName: assistantDisplayName)
                                         .id(index)
                                 }
                             } else {
                                 ForEach(client.threadItems) { item in
-                                    ChatMessageCard(role: item.isUser ? "user" : "codex", text: item.text, compact: item.type != nil)
+                                    ThreadItemCard(item: item, assistantName: assistantDisplayName)
                                         .id(item.id)
                                 }
                             }
@@ -130,22 +138,31 @@ struct ThreadsView: View {
                     .scrollDismissesKeyboard(.interactively)
                     .onTapGesture { hideKeyboard() }
                     .onAppear { scrollToLatest(proxy, animated: false) }
-                    .onChange(of: client.threadItems.count) { _ in scrollToLatest(proxy) }
-                    .onChange(of: client.threadItems.last?.id) { _ in scrollToLatest(proxy) }
+                    .onChange(of: client.threadItems.count) { _ in scrollToLatest(proxy, delay: 0.05) }
+                    .onChange(of: client.threadItems.last?.id) { _ in scrollToLatest(proxy, delay: 0.05) }
+                    .onChange(of: client.threadItems.last?.text) { _ in scrollToLatest(proxy, delay: 0.05) }
+                    .onReceive(client.$threadItems) { _ in scrollToLatest(proxy, delay: 0.05) }
                     .onChange(of: client.selectedThreadId) { _ in scrollToLatest(proxy, delay: 0.35) }
                 }
                 DesktopComposer(
                     text: $inputText,
                     guideMode: $guideMode,
                     selectedModel: $selectedModel,
+                    selectedReasoning: $selectedReasoning,
+                    permissionMode: $permissionMode,
                     onSend: sendText,
-                    onImage: { },
-                    onPermission: { }
+                    onImage: { }
                 )
             }
             .navigationTitle("iOS Codex 控制器")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showTaskSwitcher = true } label: {
+                        Image(systemName: "sidebar.left")
+                    }
+                    .accessibilityLabel("切换任务")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showActionDrawer = true } label: {
                         Image(systemName: "ellipsis")
@@ -155,6 +172,14 @@ struct ThreadsView: View {
             }
             .sheet(isPresented: $showActionDrawer) {
                 ActionDrawerView()
+            }
+            .sheet(isPresented: $showTaskSwitcher) {
+                TaskSwitcherView()
+            }
+            .onReceive(client.$codexSettings) { settings in
+                if let model = settings.model { selectedModel = model }
+                if let effort = settings.reasoningEffort { selectedReasoning = effort }
+                if let permission = settings.permissionMode { permissionMode = permission }
             }
         }
     }
@@ -186,6 +211,11 @@ struct ThreadsView: View {
         .shadow(color: .black.opacity(0.05), radius: 12, y: 5)
     }
 
+    private var assistantDisplayName: String {
+        let modelName = client.modelCatalog.first(where: { $0.id == selectedModel })?.title ?? selectedModel
+        return "\(modelName) \(reasoningLabel(selectedReasoning))"
+    }
+
     private func sendText() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -204,7 +234,7 @@ struct ThreadsView: View {
     private func scrollToLatest(_ proxy: ScrollViewProxy, animated: Bool = true, delay: Double = 0.12) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             if animated {
-                withAnimation(.easeOut(duration: 0.25)) {
+                withAnimation(.easeOut(duration: 0.18)) {
                     proxy.scrollTo(latestMessageAnchor, anchor: .bottom)
                 }
             } else {
@@ -310,11 +340,12 @@ struct ChatMessageCard: View {
     let role: String
     let text: String
     let compact: Bool
+    var assistantName: String = "GPT-5.5 高"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(role == "user" ? "你" : "Codex")
+                Text(role == "user" ? "你" : assistantName)
                     .font(.caption.bold())
                     .foregroundStyle(role == "user" ? .blue : .secondary)
                 Spacer()
@@ -340,28 +371,313 @@ struct ChatMessageCard: View {
     }
 }
 
+struct ThreadItemCard: View {
+    let item: RemoteThreadItem
+    let assistantName: String
+
+    var body: some View {
+        if item.isStatus {
+            StatusItemView(item: item)
+        } else if item.isFileChange {
+            FileChangeItemView(item: item)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(item.isUser ? "你" : assistantName)
+                        .font(.caption.bold())
+                        .foregroundStyle(item.isUser ? .blue : .secondary)
+                    Spacer()
+                    if let type = item.type, !type.isEmpty {
+                        Text(typeLabel(type))
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color(.tertiarySystemFill), in: Capsule())
+                    }
+                }
+                if !item.text.isEmpty {
+                    Text(item.text)
+                        .font(.subheadline)
+                        .textSelection(.enabled)
+                }
+                ImageStrip(images: item.images ?? [])
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(item.isUser ? Color.blue.opacity(0.12) : Color(.systemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color(.separator).opacity(0.25), lineWidth: 1))
+        }
+    }
+
+    private func typeLabel(_ type: String) -> String {
+        switch type.lowercased() {
+        case "usermessage": return "消息"
+        case "agentmessage": return "回复"
+        default: return type
+        }
+    }
+}
+
+struct StatusItemView: View {
+    let item: RemoteThreadItem
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .scaleEffect(0.72)
+            Text(item.text.isEmpty ? "正在处理" : item.text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(.secondarySystemBackground), in: Capsule())
+    }
+}
+
+struct FileChangeItemView: View {
+    let item: RemoteThreadItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "doc.badge.gearshape")
+                .font(.title3)
+                .foregroundStyle(.green)
+                .frame(width: 32, height: 32)
+                .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            VStack(alignment: .leading, spacing: 4) {
+                Text("文件变更")
+                    .font(.subheadline.bold())
+                Text(item.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(5)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color(.separator).opacity(0.22), lineWidth: 1))
+    }
+}
+
+struct ImageStrip: View {
+    let images: [RemoteThreadImage]
+
+    var body: some View {
+        if !images.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(images) { image in
+                        if let uiImage = image.image {
+                            Image(uiImage: uiImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 96, height: 96)
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color(.separator).opacity(0.3), lineWidth: 1))
+                        } else {
+                            VStack(spacing: 6) {
+                                Image(systemName: "photo")
+                                    .font(.title3)
+                                Text(image.error ?? image.fileName ?? "图片")
+                                    .font(.caption2)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                            }
+                            .foregroundStyle(.secondary)
+                            .frame(width: 96, height: 96)
+                            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct TaskSwitcherView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var client: RemoteClient
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("任务") {
+                    ForEach(client.threads) { thread in
+                        Button {
+                            Task {
+                                await client.selectThread(thread, settings: settings)
+                                dismiss()
+                            }
+                        } label: {
+                            ThreadRow(thread: thread, selected: thread.id == client.selectedThreadId)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .navigationTitle("切换任务")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+struct ModelReasoningMenu: View {
+    @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var client: RemoteClient
+    @Binding var selectedModel: String
+    @Binding var selectedReasoning: String
+
+    private var selectedModelTitle: String {
+        client.modelCatalog.first(where: { $0.id == selectedModel })?.title ?? selectedModel
+    }
+
+    private var selectedEfforts: [CodexReasoningEffort] {
+        client.modelCatalog.first(where: { $0.id == selectedModel })?.supportedReasoningEfforts ?? [
+            CodexReasoningEffort(id: "low", description: nil),
+            CodexReasoningEffort(id: "medium", description: nil),
+            CodexReasoningEffort(id: "high", description: nil)
+        ]
+    }
+
+    var body: some View {
+        Menu {
+            Menu("模型") {
+                if client.modelCatalog.isEmpty {
+                    Text("等待电脑端模型列表")
+                } else {
+                    ForEach(client.modelCatalog) { model in
+                        Button {
+                            selectedModel = model.id
+                            let effort = model.supportedReasoningEfforts?.contains(where: { $0.id == selectedReasoning }) == true
+                                ? selectedReasoning
+                                : (model.defaultReasoningEffort ?? model.supportedReasoningEfforts?.first?.id ?? selectedReasoning)
+                            selectedReasoning = effort
+                            Task { await client.updateCodexSettings(model: model.id, reasoningEffort: effort, permissionMode: nil, settings: settings) }
+                        } label: {
+                            if model.id == selectedModel {
+                                Label(model.title, systemImage: "checkmark")
+                            } else {
+                                Text(model.title)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Menu("推理强度") {
+                ForEach(selectedEfforts) { effort in
+                    Button {
+                        selectedReasoning = effort.id
+                        Task { await client.updateCodexSettings(model: selectedModel, reasoningEffort: effort.id, permissionMode: nil, settings: settings) }
+                    } label: {
+                        if effort.id == selectedReasoning {
+                            Label(reasoningLabel(effort.id), systemImage: "checkmark")
+                        } else {
+                            Text(reasoningLabel(effort.id))
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Text("\(selectedModelTitle) \(reasoningLabel(selectedReasoning))")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                Image(systemName: "chevron.down")
+                    .font(.caption2)
+            }
+            .font(.caption2)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color(.tertiarySystemFill), in: Capsule())
+        }
+    }
+}
+
+struct PermissionMenu: View {
+    @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var client: RemoteClient
+    @Binding var permissionMode: String
+
+    var body: some View {
+        Menu {
+            Text("如何批准 ChatGPT 操作？")
+                .font(.caption)
+            Button {
+                set("ask")
+            } label: {
+                if permissionMode == "ask" {
+                    Label("请求批准", systemImage: "checkmark")
+                } else {
+                    Label("请求批准", systemImage: "hand.raised")
+                }
+            }
+            Button {
+                set("auto")
+            } label: {
+                if permissionMode == "auto" {
+                    Label("替我审批", systemImage: "checkmark")
+                } else {
+                    Label("替我审批", systemImage: "shield")
+                }
+            }
+            Button {
+                set("full")
+            } label: {
+                if permissionMode == "full" {
+                    Label("完全访问", systemImage: "checkmark")
+                } else {
+                    Label("完全访问", systemImage: "exclamationmark.shield.fill")
+                }
+            }
+        } label: {
+            Image(systemName: "exclamationmark.shield.fill")
+                .foregroundStyle(permissionMode == "full" ? .orange : .primary)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+    }
+
+    private func set(_ mode: String) {
+        permissionMode = mode
+        Task { await client.updateCodexSettings(model: nil, reasoningEffort: nil, permissionMode: mode, settings: settings) }
+    }
+}
+
 struct DesktopComposer: View {
     @Binding var text: String
     @Binding var guideMode: Bool
     @Binding var selectedModel: String
+    @Binding var selectedReasoning: String
+    @Binding var permissionMode: String
     let onSend: () -> Void
     let onImage: () -> Void
-    let onPermission: () -> Void
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             TextEditor(text: $text)
-                .frame(minHeight: 76, maxHeight: 120)
-                .padding(10)
+                .frame(minHeight: 42, maxHeight: 76)
+                .padding(8)
                 .scrollContentBackground(.hidden)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay(alignment: .topLeading) {
                     if text.isEmpty {
                         Text("继续输入，或添加图片 / 引导消息...")
-                            .font(.subheadline)
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 18)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 14)
                     }
                 }
                 .toolbar {
@@ -374,35 +690,30 @@ struct DesktopComposer: View {
                         }
                     }
                 }
-            HStack(spacing: 10) {
-                Button(action: onImage) { Label("图片", systemImage: "plus") }
+            HStack(spacing: 8) {
+                Button(action: onImage) { Image(systemName: "plus") }
                     .buttonStyle(.bordered)
+                    .controlSize(.small)
                 Button { guideMode.toggle() } label: {
-                    Label(guideMode ? "引导中" : "引导", systemImage: guideMode ? "shield.lefthalf.filled" : "arrow.triangle.turn.up.right.circle")
+                    Image(systemName: guideMode ? "shield.lefthalf.filled" : "arrow.triangle.turn.up.right.circle")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.small)
                 .tint(guideMode ? .orange : .blue)
-                Button(action: onPermission) { Label("完全访问", systemImage: "exclamationmark.shield.fill") }
-                    .buttonStyle(.bordered)
-                    .foregroundStyle(.orange)
+                PermissionMenu(permissionMode: $permissionMode)
                 Spacer()
-                Menu(selectedModel) {
-                    Button("GPT-5.5 高") { selectedModel = "GPT-5.5 高" }
-                    Button("GPT-5.5 中") { selectedModel = "GPT-5.5 中" }
-                    Button("GPT-5.5 低") { selectedModel = "GPT-5.5 低" }
-                }
-                .font(.caption)
+                ModelReasoningMenu(selectedModel: $selectedModel, selectedReasoning: $selectedReasoning)
                 Button {
                     hideKeyboard()
                     onSend()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 30))
+                        .font(.system(size: 26))
                 }
                 .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(12)
+        .padding(8)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Divider() }
     }
@@ -554,19 +865,19 @@ struct WindowIssueComposer: View {
     let onSend: () -> Void
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             TextEditor(text: $note)
-                .frame(minHeight: 72, maxHeight: 110)
-                .padding(10)
+                .frame(minHeight: 42, maxHeight: 76)
+                .padding(8)
                 .scrollContentBackground(.hidden)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay(alignment: .topLeading) {
                     if note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("描述窗口问题，截图会一起发送给 Codex...")
-                            .font(.subheadline)
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 18)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 14)
                     }
                 }
                 .toolbar {
@@ -580,17 +891,19 @@ struct WindowIssueComposer: View {
                     }
                 }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Menu("窗口 \(targetSlot)") {
                     Button("窗口 A") { targetSlot = "A" }
                     Button("窗口 B") { targetSlot = "B" }
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.small)
 
                 Button { sendAsGuide.toggle() } label: {
-                    Label(sendAsGuide ? "引导中" : "引导", systemImage: sendAsGuide ? "shield.lefthalf.filled" : "arrow.triangle.turn.up.right.circle")
+                    Image(systemName: sendAsGuide ? "shield.lefthalf.filled" : "arrow.triangle.turn.up.right.circle")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.small)
                 .tint(sendAsGuide ? .orange : .blue)
 
                 Spacer()
@@ -599,12 +912,13 @@ struct WindowIssueComposer: View {
                     hideKeyboard()
                     onSend()
                 } label: {
-                    Label("发送截图", systemImage: "camera.fill")
+                    Image(systemName: "camera.fill")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
         }
-        .padding(12)
+        .padding(8)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) { Divider() }
     }

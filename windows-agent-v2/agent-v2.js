@@ -1,9 +1,9 @@
-﻿const os = require('os');
+const os = require('os');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const RELAY_URL = (process.env.RELAY_URL || 'http://115.159.221.170:8081').replace(/\/$/, '');
+const RELAY_URL = (process.env.RELAY_URL || 'http://115.159.221.170:8080').replace(/\/$/, '');
 const AGENT_TOKEN = process.env.AGENT_TOKEN || 'change-me-agent-token';
 const AGENT_ID = process.env.AGENT_ID || `${os.hostname()}-codex-agent-v2`;
 const CAPTURE_INTERVAL_MS = Number(process.env.CAPTURE_INTERVAL_MS || 1200);
@@ -153,31 +153,99 @@ class CodexAppServer {
     return (items || []).slice(-80).map((item, index) => {
       const raw = item.item || item;
       const role = raw.role || raw.type || item.type || 'item';
+      const images = [];
       let text = '';
-      if (typeof raw.text === 'string') text = raw.text;
+
+      if (raw.type === 'fileChange') {
+        text = summarizeFileChange(raw);
+      } else if (typeof raw.text === 'string') {
+        text = raw.text;
+      }
+
       if (!text && typeof raw.message === 'string') text = raw.message;
+
       if (!text && Array.isArray(raw.content)) {
         text = raw.content.map(c => {
           if (typeof c === 'string') return c;
+          if ((c.type === 'localImage' || c.type === 'image') && c.path) {
+            const image = imageAttachmentFromPath(c.path);
+            if (image) images.push(image);
+            return '';
+          }
+          if ((c.type === 'image' || c.type === 'image_url') && c.url) {
+            images.push({ id: c.url, fileName: path.basename(c.url), mimeType: 'image/jpeg', url: c.url, dataBase64: null, error: null });
+            return '';
+          }
           return c.text || c.content || c.summary || '';
         }).filter(Boolean).join('\n');
+        if (raw.type === 'userMessage') text = cleanUserText(text);
       }
+
       if (!text && Array.isArray(raw.summary)) text = raw.summary.join('\n');
       if (!text && raw.name) text = raw.name;
-      if (!text) {
-        try { text = JSON.stringify(raw).slice(0, 1200); } catch { text = ''; }
-      }
+      if (!text && raw.type === 'reasoning') text = '正在思考 / 处理中';
+      if (!text) text = '';
+
       return {
         id: raw.id || item.id || `${Date.now()}-${index}`,
         role,
         text,
         createdAt: raw.createdAt || item.createdAt || null,
-        type: raw.type || item.type || null
+        type: raw.type || item.type || null,
+        images
       };
-    }).filter(x => x.text);
+    }).filter(x => x.text || (x.images && x.images.length));
   }
 
-  async sendMessage(message, attachmentPaths = []) {
+  async listModels() {
+    await this.initialize();
+    const result = await this.request('model/list', {});
+    return (result.data || []).filter(m => !m.hidden).map(m => ({
+      id: m.id || m.model,
+      model: m.model || m.id,
+      displayName: m.displayName || m.model || m.id,
+      description: m.description || null,
+      isDefault: m.isDefault || false,
+      defaultReasoningEffort: m.defaultReasoningEffort || null,
+      supportedReasoningEfforts: (m.supportedReasoningEfforts || []).map(e => ({
+        id: e.reasoningEffort,
+        description: e.description || null
+      }))
+    }));
+  }
+
+  async readConfig() {
+    await this.initialize();
+    const result = await this.request('config/read', {});
+    const c = result.config || {};
+    return {
+      model: c.model || null,
+      reasoningEffort: c.model_reasoning_effort || null,
+      permissionMode: 'ask'
+    };
+  }
+
+  mapPermission(permissionMode) {
+    if (permissionMode === 'full') return { approvalPolicy: 'never', permissions: ':danger-full-access' };
+    if (permissionMode === 'auto') return { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', permissions: null };
+    return { approvalPolicy: 'on-request', approvalsReviewer: 'user', permissions: null };
+  }
+
+  async updateThreadSettings(threadId, settings) {
+    await this.initialize();
+    if (!threadId) return null;
+    const permission = this.mapPermission(settings.permissionMode || 'ask');
+    return await this.request('thread/settings/update', {
+      threadId,
+      model: settings.model || null,
+      effort: settings.reasoningEffort || null,
+      approvalPolicy: permission.approvalPolicy,
+      approvalsReviewer: permission.approvalsReviewer || null,
+      permissions: permission.permissions || null
+    }, 30000);
+  }
+
+  async sendMessage(message, attachmentPaths = [], settings = {}) {
     await this.initialize();
     const threadId = message.threadId;
     if (!threadId) throw new Error('没有选择 Codex 任务');
@@ -194,13 +262,74 @@ class CodexAppServer {
       if (expectedTurnId) {
         return await this.request('turn/steer', { threadId, expectedTurnId, input }, 30000);
       }
-      return await this.request('turn/start', { threadId, input }, 30000);
+      return await this.request('turn/start', { threadId, input, model: settings.model || null, effort: settings.reasoningEffort || null, approvalPolicy: this.mapPermission(settings.permissionMode || 'ask').approvalPolicy, permissions: this.mapPermission(settings.permissionMode || 'ask').permissions || null }, 30000);
     }
-    return await this.request('turn/start', { threadId, input }, 30000);
+    return await this.request('turn/start', { threadId, input, model: settings.model || null, effort: settings.reasoningEffort || null, approvalPolicy: this.mapPermission(settings.permissionMode || 'ask').approvalPolicy, permissions: this.mapPermission(settings.permissionMode || 'ask').permissions || null }, 30000);
   }
 }
 
 const codex = new CodexAppServer();
+let latestCodexSettings = { model: null, reasoningEffort: null, permissionMode: 'ask' };
+
+function mergeDefinedSettings(base, incoming) {
+  const next = { ...base };
+  if (!incoming) return next;
+  if (incoming.model) next.model = incoming.model;
+  if (incoming.reasoningEffort) next.reasoningEffort = incoming.reasoningEffort;
+  if (incoming.permissionMode) next.permissionMode = incoming.permissionMode;
+  return next;
+}
+
+function mimeFromPath(filePath) {
+  const ext = path.extname(filePath || '').toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  return 'image/jpeg';
+}
+
+function imageAttachmentFromPath(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    const stat = fs.statSync(filePath);
+    return {
+      id: filePath,
+      fileName: path.basename(filePath),
+      mimeType: mimeFromPath(filePath),
+      localPath: filePath,
+      dataBase64: stat.size <= 8 * 1024 * 1024 ? fs.readFileSync(filePath).toString('base64') : null,
+      error: stat.size > 8 * 1024 * 1024 ? '图片过大，暂不预览' : null
+    };
+  } catch (err) {
+    return {
+      id: filePath || `image-${Date.now()}`,
+      fileName: path.basename(filePath || 'image'),
+      mimeType: mimeFromPath(filePath),
+      localPath: filePath,
+      dataBase64: null,
+      error: err.message
+    };
+  }
+}
+
+function cleanUserText(text) {
+  if (!text) return '';
+  const marker = '## My request for Codex:';
+  const idx = text.indexOf(marker);
+  if (idx >= 0) return text.slice(idx + marker.length).trim();
+  return text.replace(/# Files mentioned by the user:[\s\S]*?(?=## My request for Codex:|$)/, '').trim();
+}
+
+function summarizeFileChange(raw) {
+  const changes = Array.isArray(raw.changes) ? raw.changes : [];
+  const lines = changes.slice(0, 8).map(change => {
+    const file = path.basename(change.path || 'unknown');
+    const kind = change.kind?.type || change.kind || 'update';
+    return `• ${kind}: ${file}`;
+  });
+  const extra = changes.length > 8 ? `\n…另外 ${changes.length - 8} 个文件` : '';
+  return `文件变更 ${changes.length} 个\n${lines.join('\n')}${extra}`;
+}
 
 async function api(path, options = {}) {
   const res = await fetch(RELAY_URL + path, {
@@ -287,7 +416,7 @@ async function handleInboundMessages(messages) {
   const saved = saveInboundMessages(messages) || [];
   for (const item of saved) {
     try {
-      await codex.sendMessage(item.message, item.attachmentPaths);
+      await codex.sendMessage(item.message, item.attachmentPaths, latestCodexSettings);
       console.log(`[codex] sent ${item.message.id} to thread ${item.message.threadId || '(selected)'}`);
     } catch (err) {
       console.error(`[codex] failed to send ${item.message.id}: ${err.message}`);
@@ -316,6 +445,8 @@ async function main() {
   let threads = [];
   let lastCodex = 0;
   let codexStatus = 'Codex 未连接';
+  let modelCatalog = [];
+  let codexConfig = {};
 
   while (true) {
     try {
@@ -328,6 +459,9 @@ async function main() {
       if (now - lastCodex > CODEX_INTERVAL_MS) {
         try {
           threads = await codex.listThreads(20);
+          modelCatalog = await codex.listModels();
+          codexConfig = await codex.readConfig();
+          latestCodexSettings = mergeDefinedSettings(latestCodexSettings, codexConfig);
           codexStatus = `Codex 已连接，发现 ${threads.length} 个任务`;
         } catch (err) {
           codexStatus = `Codex 连接失败：${err.message}`;
@@ -336,6 +470,10 @@ async function main() {
       }
 
       const control = await api('/agent/control');
+      if (control.codexSettings) {
+        latestCodexSettings = mergeDefinedSettings(latestCodexSettings, control.codexSettings);
+        try { await codex.updateThreadSettings(control.selectedThreadId, latestCodexSettings); } catch (err) { console.error(`[codex] settings update failed: ${err.message}`); }
+      }
       let threadItems = [];
       if (control.selectedThreadId) {
         try {
@@ -371,7 +509,9 @@ async function main() {
         windows,
         slots,
         threads,
-        threadItems
+        threadItems,
+        modelCatalog,
+        codexSettings: latestCodexSettings
       });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] ${err.message}`);
@@ -385,7 +525,6 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
-
 
 
 

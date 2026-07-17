@@ -1,4 +1,4 @@
-﻿const http = require('http');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
@@ -28,6 +28,12 @@ let state = {
   threads: [],
   threadItems: [],
   selectedThreadId: null,
+  modelCatalog: [],
+  codexSettings: {
+    model: null,
+    reasoningEffort: null,
+    permissionMode: "ask"
+  },
   events: [],
   uploads: [],
   pendingMessages: []
@@ -94,6 +100,8 @@ function compactState() {
     threads: state.threads,
     threadItems: state.threadItems || [],
     selectedThreadId: state.selectedThreadId,
+    modelCatalog: state.modelCatalog || [],
+    codexSettings: state.codexSettings || {},
     time: now()
   };
 }
@@ -120,6 +128,19 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && url.pathname === '/api/state') return send(res, 200, compactState());
       if (req.method === 'GET' && url.pathname === '/api/windows') return send(res, 200, { ok: true, windows: state.windows, slots: state.slots, agent: state.agent });
       if (req.method === 'GET' && url.pathname === '/api/threads') return send(res, 200, { ok: true, threads: state.threads, selectedThreadId: state.selectedThreadId, agent: state.agent });
+      if (req.method === 'POST' && url.pathname === '/api/codex/settings') {
+        const body = await readBody(req);
+        state.codexSettings = {
+          ...state.codexSettings,
+          model: body.model || state.codexSettings.model || null,
+          reasoningEffort: body.reasoningEffort || state.codexSettings.reasoningEffort || null,
+          permissionMode: body.permissionMode || state.codexSettings.permissionMode || "ask",
+          updatedAt: now()
+        };
+        pushEvent('codexSettingsChanged', state.codexSettings);
+        save();
+        return send(res, 200, { ok: true, codexSettings: state.codexSettings });
+      }
       if (req.method === 'POST' && url.pathname === '/api/uploads') {
         const body = await readBody(req);
         if (!body.dataBase64) return send(res, 400, { ok: false, error: 'dataBase64 is required' });
@@ -189,6 +210,7 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           selectedSlots: state.slots.map(s => ({ slot: s.slot, hwnd: s.hwnd })),
           selectedThreadId: state.selectedThreadId,
+          codexSettings: state.codexSettings || {},
           desiredCaptureIntervalMs: 1200,
           time: now()
         });
@@ -227,6 +249,8 @@ const server = http.createServer(async (req, res) => {
           }
         }
         if (Array.isArray(body.threadItems)) state.threadItems = body.threadItems;
+        if (Array.isArray(body.modelCatalog)) state.modelCatalog = body.modelCatalog;
+        if (body.codexSettings) state.codexSettings = { ...state.codexSettings, ...body.codexSettings };
         if (Array.isArray(body.slots)) {
           for (const incoming of body.slots) {
             const slot = state.slots.find(s => s.slot === incoming.slot);

@@ -1,4 +1,4 @@
-﻿import Foundation
+import Foundation
 import SwiftUI
 
 final class AppSettings: ObservableObject {
@@ -22,6 +22,8 @@ struct RelayState: Decodable {
     let slots: [WindowSlot]
     let threads: [RemoteThread]
     let threadItems: [RemoteThreadItem]?
+    let modelCatalog: [CodexModel]?
+    let codexSettings: CodexSettings?
     let selectedThreadId: String?
     let time: String?
 }
@@ -87,11 +89,71 @@ struct RemoteThreadItem: Identifiable, Decodable {
     let text: String
     let createdAt: String?
     let type: String?
+    let images: [RemoteThreadImage]?
 
     var isUser: Bool {
         let r = (role ?? "").lowercased()
         return r.contains("user") || r == "input"
     }
+
+    var isStatus: Bool {
+        let t = (type ?? "").lowercased()
+        return t == "reasoning" || t.contains("status")
+    }
+
+    var isFileChange: Bool {
+        (type ?? "").lowercased() == "filechange"
+    }
+}
+
+struct RemoteThreadImage: Identifiable, Decodable {
+    let id: String
+    let fileName: String?
+    let mimeType: String?
+    let localPath: String?
+    let dataBase64: String?
+    let url: String?
+    let error: String?
+
+    var image: UIImage? {
+        guard let dataBase64, let data = Data(base64Encoded: dataBase64) else { return nil }
+        return UIImage(data: data)
+    }
+}
+
+struct CodexModel: Identifiable, Decodable, Hashable {
+    let id: String
+    let model: String?
+    let displayName: String?
+    let description: String?
+    let isDefault: Bool?
+    let defaultReasoningEffort: String?
+    let supportedReasoningEfforts: [CodexReasoningEffort]?
+
+    var title: String { displayName ?? model ?? id }
+}
+
+struct CodexReasoningEffort: Identifiable, Decodable, Hashable {
+    let id: String
+    let description: String?
+}
+
+struct CodexSettings: Codable, Hashable {
+    let model: String?
+    let reasoningEffort: String?
+    let permissionMode: String?
+    let updatedAt: String?
+}
+
+struct CodexSettingsRequest: Encodable {
+    let model: String?
+    let reasoningEffort: String?
+    let permissionMode: String?
+}
+
+struct CodexSettingsEnvelope: Decodable {
+    let ok: Bool
+    let codexSettings: CodexSettings?
 }
 
 struct SelectThreadRequest: Encodable {

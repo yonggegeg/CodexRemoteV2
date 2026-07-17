@@ -12,6 +12,8 @@ final class RemoteClient: ObservableObject {
     ]
     @Published var threads: [RemoteThread] = []
     @Published var threadItems: [RemoteThreadItem] = []
+    @Published var modelCatalog: [CodexModel] = []
+    @Published var codexSettings = CodexSettings(model: nil, reasoningEffort: nil, permissionMode: "ask", updatedAt: nil)
     @Published var selectedThreadId: String?
     @Published var lastError: String?
     @Published var lastSendStatus: String?
@@ -46,6 +48,10 @@ final class RemoteClient: ObservableObject {
             slots = state.slots.sorted { $0.slot < $1.slot }
             threads = state.threads
             threadItems = state.threadItems ?? []
+            modelCatalog = state.modelCatalog ?? []
+            if let codexSettings = state.codexSettings {
+                self.codexSettings = codexSettings
+            }
             selectedThreadId = state.selectedThreadId
             agentText = state.agent.online ? (state.agent.statusText ?? "Windows Agent 在线") : "Windows Agent 离线"
             lastError = nil
@@ -94,6 +100,23 @@ final class RemoteClient: ObservableObject {
         } catch {
             lastError = error.localizedDescription
             lastSendStatus = nil
+        }
+    }
+
+    func updateCodexSettings(model: String?, reasoningEffort: String?, permissionMode: String?, settings: AppSettings) async {
+        do {
+            let body = CodexSettingsRequest(
+                model: model ?? codexSettings.model,
+                reasoningEffort: reasoningEffort ?? codexSettings.reasoningEffort,
+                permissionMode: permissionMode ?? codexSettings.permissionMode
+            )
+            let envelope: CodexSettingsEnvelope = try await request(settings: settings, path: "/api/codex/settings", method: "POST", body: body)
+            if let updated = envelope.codexSettings {
+                codexSettings = updated
+            }
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
