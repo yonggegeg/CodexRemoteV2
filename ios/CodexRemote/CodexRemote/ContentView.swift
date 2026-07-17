@@ -1,4 +1,10 @@
-﻿import SwiftUI
+import SwiftUI
+import UIKit
+
+private func hideKeyboard() {
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+}
+
 
 struct RootView: View {
     @EnvironmentObject private var settings: AppSettings
@@ -118,6 +124,8 @@ struct ThreadsView: View {
                         .padding(16)
                     }
                     .background(Color(.systemGroupedBackground))
+                    .scrollDismissesKeyboard(.interactively)
+                    .onTapGesture { hideKeyboard() }
                 }
                 DesktopComposer(
                     text: $inputText,
@@ -176,6 +184,7 @@ struct ThreadsView: View {
         guard !text.isEmpty else { return }
         let outgoing = text
         inputText = ""
+        hideKeyboard()
         Task {
             if guideMode {
                 await client.sendGuideMessage(outgoing, settings: settings)
@@ -336,6 +345,16 @@ struct DesktopComposer: View {
                             .padding(.vertical, 18)
                     }
                 }
+                .toolbar {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button {
+                            hideKeyboard()
+                        } label: {
+                            Image(systemName: "keyboard.chevron.compact.down")
+                        }
+                    }
+                }
             HStack(spacing: 10) {
                 Button(action: onImage) { Label("图片", systemImage: "plus") }
                     .buttonStyle(.bordered)
@@ -354,7 +373,10 @@ struct DesktopComposer: View {
                     Button("GPT-5.5 低") { selectedModel = "GPT-5.5 低" }
                 }
                 .font(.caption)
-                Button(action: onSend) {
+                Button {
+                    hideKeyboard()
+                    onSend()
+                } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.system(size: 30))
                 }
@@ -472,6 +494,8 @@ struct WindowsMonitorView: View {
                     .padding(.bottom, 8)
                 }
                 .background(Color(.systemGroupedBackground))
+                .scrollDismissesKeyboard(.interactively)
+                .onTapGesture { hideKeyboard() }
 
                 WindowIssueComposer(
                     note: $screenshotNote,
@@ -526,6 +550,16 @@ struct WindowIssueComposer: View {
                             .padding(.vertical, 18)
                     }
                 }
+                .toolbar {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button {
+                            hideKeyboard()
+                        } label: {
+                            Image(systemName: "keyboard.chevron.compact.down")
+                        }
+                    }
+                }
 
             HStack(spacing: 10) {
                 Menu("窗口 \(targetSlot)") {
@@ -542,7 +576,10 @@ struct WindowIssueComposer: View {
 
                 Spacer()
 
-                Button(action: onSend) {
+                Button {
+                    hideKeyboard()
+                    onSend()
+                } label: {
                     Label("发送截图", systemImage: "camera.fill")
                 }
                 .buttonStyle(.borderedProminent)
