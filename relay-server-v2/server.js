@@ -80,7 +80,7 @@ function auth(req, kind) {
 }
 
 function send(res, status, data) {
-  const body = JSON.stringify(data, null, 2);
+  const body = JSON.stringify(data);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),

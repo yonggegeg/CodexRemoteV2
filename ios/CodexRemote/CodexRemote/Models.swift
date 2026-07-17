@@ -4,7 +4,7 @@ import SwiftUI
 final class AppSettings: ObservableObject {
     @AppStorage("serverURL") var serverURL: String = "http://115.159.221.170:8080" { willSet { objectWillChange.send() } }
     @AppStorage("appToken") var appToken: String = "" { willSet { objectWillChange.send() } }
-    @AppStorage("refreshSeconds") var refreshSeconds: Double = 1.2 { willSet { objectWillChange.send() } }
+    @AppStorage("refreshSeconds") var refreshSeconds: Double = 0.8 { willSet { objectWillChange.send() } }
 }
 
 struct RelayHealth: Decodable {

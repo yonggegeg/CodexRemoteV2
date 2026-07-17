@@ -228,11 +228,6 @@ struct ThreadsView: View {
                         VStack(alignment: .leading, spacing: 14) {
                             HeaderCard()
                             workspaceHeader
-                            if !client.threadItems.isEmpty && client.hasMoreHistory {
-                                LoadOlderMessagesView(isLoading: client.isLoadingOlder) {
-                                    Task { await client.loadOlderMessages(settings: settings) }
-                                }
-                            }
                             if client.threadItems.isEmpty {
                                 ForEach(Array(sampleMessages.enumerated()), id: \.offset) { index, message in
                                     ChatMessageCard(role: message.0, text: message.1, compact: message.2, assistantName: assistantDisplayName)
@@ -594,32 +589,6 @@ struct ChatMessageCard: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color(.separator).opacity(0.25), lineWidth: 1)
         )
-    }
-}
-
-struct LoadOlderMessagesView: View {
-    let isLoading: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                if isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Image(systemName: "clock.arrow.circlepath")
-                }
-                Text(isLoading ? "正在从电脑读取更早消息…" : "加载更早消息")
-                    .font(.caption.weight(.semibold))
-            }
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .background(Color(.secondarySystemBackground), in: Capsule())
-        }
-        .buttonStyle(.plain)
-        .disabled(isLoading)
     }
 }
 
